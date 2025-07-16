@@ -1,0 +1,7 @@
+__pycache__
+*.p
+*.pt
+*.mp4
+single/trained
+multi/trained
+data/
