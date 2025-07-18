@@ -38,20 +38,19 @@ def main():
     # Define all the constants first
     T = 0.25; H = 20
     bounds = {
-        "x_max": 4.0, "x_min": 0.0, 
-        "y_max": 4.0, "y_min": 0.0,
-        "v_max": 0.5, "v_min": -0.5, 
-        "u_max": 0.5, "u_min": -0.5, 
+        "x_max": 1.75, "x_min": -0.25, 
+        "y_max": 0.13, "y_min": -2.70,
+        "v_max": 0.50, "v_min": -0.50, 
+        "u_max": 0.50, "u_min": -0.50, 
     }
     d_min = 0.25
 
     # List of obstacles, fixed for now
     with_obs = True
     if with_obs:
-        Obs = [
-            obstacle(1.0, 1.5, 0.8, 1.6, 0.),
-            obstacle(3.0, 2.0, 1.8, 0.6, np.pi/2)
-        ]
+        Obs = [obstacle(1.0, 0.0, 0.3, 0.44, 0.0), # obst 1
+                obstacle(0.7, -1.1, 0.44, 0.3, 0.0), # obst 2
+                obstacle(0.40, -2.50, 0.3, 0.44, 0.0)] # obst 3
     else:
         Obs = []
     n_obs = len(Obs)
