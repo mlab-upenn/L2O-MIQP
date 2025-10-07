@@ -5,3 +5,6 @@ __pycache__
 single/trained
 multi/trained
 data/
+wandb
+wandb/
+self_supervised/wandb/

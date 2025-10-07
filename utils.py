@@ -1,5 +1,7 @@
 import numpy as np
 import numpy.linalg as LA
+import torch
+import torch.nn as nn
 
 def binary_to_decimal(binary_array):
     powers_of_two = 2**np.arange(len(binary_array))[::-1]  # Compute powers of 2
@@ -10,7 +12,6 @@ def decimal_to_binary(n, bits=20):
     binary = bin(n)[2:]
     binary = binary.zfill(bits)
     return np.array([int(bit) for bit in binary], dtype=np.int8)
-
 
 # Function to check whether initial locations have collisions
 def check_inter_collision(s, d_min):
@@ -74,3 +75,31 @@ def init_velocity(bounds, M):
         np.round(np.random.uniform(bounds["v_min"], bounds["v_max"], (1, M)), 3)
     ))
     return v
+
+# Convert an integer to 4 binaries (bits)
+def int_to_four_bins(n):
+    return np.array(list(np.binary_repr(int(n), width=4))).astype(int)
+
+# This function computes the average accuracy per binary
+def compute_bitwise_accuracy(preds, targets):
+    return (preds == targets).float().mean().item()
+
+# This function computes the strict accuracy: it counts how many entire binary vectors are predicted exactly right
+def compute_exact_match_accuracy(preds, targets):
+    return torch.all(preds == targets, dim=1).float().mean().item()
+
+def NNoutput_reshape(outputs, N_obs):
+    dis_traj_temp = outputs.reshape([N_obs,-1], order='C')
+    dis_traj = np.array([dis_traj_temp[i].reshape([4,-1], order='F') for i in range(2)])
+    return dis_traj
+
+# torch version of the function above
+def NNoutput_reshape_torch(outputs: torch.Tensor, N_obs: int):
+    if outputs.dim() == 1:
+        outputs = outputs.view(N_obs, -1) # (N_obs, 4*H)
+    H = outputs.shape[1] // 4
+    # reshape to (N_obs, H, 4) in C-order
+    dis_traj = outputs.view(N_obs, H, 4)
+    # transpose to (N_obs, 4, H) to match NumPy's F-order reshape
+    dis_traj = dis_traj.transpose(1, 2).contiguous()
+    return dis_traj
