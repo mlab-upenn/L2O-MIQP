@@ -1,17 +1,72 @@
 import numpy as np
-import random
 import pickle, os
 import torch
+import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.autograd import Variable
-from torch.nn import Sigmoid
+from torch.utils.data import TensorDataset, DataLoader, random_split
 from datetime import datetime
-import time
+import wandb
 
 from utils import *
-from model import FFNet, LSTMNet
+from model import FFNet
 
+"""
+Some functions
+"""
+def constraint_violation(dis_traj, cont_traj, Obs_info):
+    """
+    dis_traj: N_obs x 4 x H array
+    cont_traj: 2 x H array only for positions
+    some other parameters such as obstacle info are hard-coded for now
+    """
+    bigM = 1e3
+    d_min = 0.25
+    N_obs = Obs_info.shape[0]
+    violation = 0.0
+    for o in range(N_obs):
+        xo, yo, L0, W0, th = Obs_info[o,:]
+        L0 = L0/2 + d_min; W0 = W0/2 + d_min
+        # 4 constraints
+        c1 = np.maximum(0, np.cos(th)*(cont_traj[0, 1:]-xo) + np.sin(th)*(cont_traj[1, 1:]-yo) - L0 - bigM*(1-dis_traj[o,0,:]))
+        c2 = np.maximum(0, -np.sin(th)*(cont_traj[0, 1:]-xo) + np.cos(th)*(cont_traj[1, 1:]-yo) - W0 - bigM*(1-dis_traj[o,1,:]))
+        c3 = np.maximum(0, -np.cos(th)*(cont_traj[0, 1:]-xo) - np.sin(th)*(cont_traj[1, 1:]-yo) - L0 - bigM*(1-dis_traj[o,2,:]))
+        c4 = np.maximum(0, np.sin(th)*(cont_traj[0, 1:]-xo) - np.cos(th)*(cont_traj[1, 1:]-yo) - W0 - bigM*(1-dis_traj[o,3,:]))
+        violation += np.sum(c1 + c2 + c3 + c4)
+    return violation
+
+# torch version of the function above
+def constraint_violation_torch(dis_traj, cont_traj, Obs_info):
+    """
+    dis_traj: (N_obs, 4, H) tensor of discrete decision variables
+    cont_traj: (2, H) tensor of continuous variables (positions)
+    Returns: scalar tensor representing negative constraint violation
+    """
+    device = cont_traj.device
+    bigM = 1e3; d_min = 0.25
+    Obs_info = torch.from_numpy(Obs_info).to(device)
+
+    violation = 0.0
+    for o in range(Obs_info.size(0)):
+        xo, yo, L0, W0, th = Obs_info[o]
+        L0 = L0 / 2 + d_min; W0 = W0 / 2 + d_min
+        x = cont_traj[0, 1:]; y = cont_traj[1, 1:]
+        cos_th = torch.cos(th); sin_th = torch.sin(th)
+        d = dis_traj[o] # (4, H)
+        c1 = torch.relu(cos_th * (x - xo) + sin_th * (y - yo) - L0 - bigM * (1 - d[0, :]))
+        c2 = torch.relu(-sin_th * (x - xo) + cos_th * (y - yo) - W0 - bigM * (1 - d[1, :]))
+        c3 = torch.relu(-cos_th * (x - xo) - sin_th * (y - yo) - L0 - bigM * (1 - d[2, :]))
+        c4 = torch.relu(sin_th * (x - xo) - cos_th * (y - yo) - W0 - bigM * (1 - d[3, :]))
+        c5 = torch.relu(1 - d.sum(dim=0))
+
+        violation += torch.sum(c1 + c2 + c3 + c4 + c5)
+
+    return violation
+
+"""
+Main classes
+"""
 class Regression:
 
     def __init__(self, prob_features):
@@ -19,54 +74,51 @@ class Regression:
         Constructor for Regression class.
         """
         self.prob_features = prob_features
-
         self.num_train, self.num_test = 0, 0
         self.model, self.model_fn = None, None
+        self.n_bin = 4 # number of binaries used in the collision avoidance constraint
 
-    def construct_features(self, params, ii_obs=None):
+    def construct_features(self, params):
         prob_features = self.prob_features
         feature_vec = np.array([])
-
-        x0, xg = params['x0'], params['xg'] 
-        obstacles = params['obstacles']
-
         for feature in prob_features:
             if feature == "x0":
+                x0 = params['x0']
                 feature_vec = np.hstack((feature_vec, x0))
             elif feature == "xg":
+                xg = params['xg'] 
                 feature_vec = np.hstack((feature_vec, xg))
             elif feature == "obstacles":
+                obstacles = params['obstacles']
                 feature_vec = np.hstack((feature_vec, np.reshape(obstacles, (4*self.n_obs))))
             elif feature == "obstacles_map":
                 continue
             else:
                 print('Feature {} is unknown'.format(feature))
-
-        # Append one-hot encoding to end
-        if ii_obs is not None:
-            one_hot = np.zeros(self.n_obs)
-            one_hot[ii_obs] = 1.
-            feature_vec = np.hstack((feature_vec, one_hot))
-
         return feature_vec
 
-    def construct_strategies(self, n_features, train_data):
+    def setup_data(self, n_features, train_data, Obs_info):
         """
         Reads in data and constructs strategy dictionary
         """
+        self.Obs_info = Obs_info
+        self.n_obs = Obs_info.shape[0] # number of obstacles
         self.n_features = n_features
 
-        self.X_train = train_data[0]
-        self.Y_train = train_data[3]
+        self.X_train = train_data[0] # Problem parameters, will be inputs of the NNs
+        self.Y_train = train_data[2] # Discrete solutions, will be outputs of the NNs
+        self.P_train = train_data[1] # Continuous trajectories, will be used as parameters in training
         self.n_y = self.Y_train[0].size # will be the dimension of the output
         self.y_shape = self.Y_train[0].shape
         self.num_train = self.Y_train.shape[0]        
 
+        # Create features and labels based on raw data
         self.features = np.zeros((self.num_train, self.n_features))
         self.labels = np.zeros((self.num_train, self.n_y))
-
+        self.outputs = np.zeros((self.num_train, self.n_y*self.n_bin))        
         for ii in range(self.num_train):
-            self.labels[ii] = np.reshape(self.Y_train[ii,:,:].T, (self.n_y))
+            self.labels[ii] = np.reshape(self.Y_train[ii,:,:], (self.n_y))
+            self.outputs[ii] = np.hstack([int_to_four_bins(val) for val in (self.labels[ii])])
             prob_params = {}
             for k in self.X_train:
                 prob_params[k] = self.X_train[k][ii]
@@ -74,13 +126,12 @@ class Regression:
 
     def setup_network(self, depth=3, neurons=32, device_id=0):
         self.device = torch.device('cuda:{}'.format(device_id))
-        
         ff_shape = [self.n_features]
         for ii in range(depth):
             ff_shape.append(neurons)
-        ff_shape.append(self.n_y)
+        ff_shape.append(self.n_y*self.n_bin)
 
-        self.model = FFNet(ff_shape, activation=torch.nn.ReLU()).to(device=self.device)
+        self.model = FFNet(ff_shape, activation=nn.ReLU()).to(device=self.device)
 
         # file names for PyTorch models
         now = datetime.now().strftime('%Y%m%d_%H%M')
@@ -88,421 +139,267 @@ class Regression:
         model_fn = os.path.join(os.getcwd(), model_fn)
         self.model_fn = model_fn.format(now)
 
-    def load_network(self, fn_regressor_model):
-        if os.path.exists(fn_regressor_model):
-            print('Loading presaved regression model from {}'.format(fn_regressor_model))
-            self.model.load_state_dict(torch.load(fn_regressor_model))
-            self.model_fn = fn_regressor_model
+    def load_network(self, fn_classifier_model):
+        if os.path.exists(fn_classifier_model):
+            print('Loading presaved Hetero GNN classifier model from {}'.format(fn_classifier_model))
+            self.model.load_state_dict(torch.load(fn_classifier_model))
+            self.model_fn = fn_classifier_model
 
     def train(self, training_params, verbose=True):
-        # grab training params
         BATCH_SIZE = training_params['BATCH_SIZE']
+        TEST_BATCH_SIZE = training_params['TEST_BATCH_SIZE']
         TRAINING_EPOCHS = training_params['TRAINING_EPOCHS']
-        BATCH_SIZE = training_params['BATCH_SIZE']
         CHECKPOINT_AFTER = training_params['CHECKPOINT_AFTER']
         SAVEPOINT_AFTER = training_params['SAVEPOINT_AFTER']
-        TEST_BATCH_SIZE = training_params['TEST_BATCH_SIZE']
+        LEARNING_RATE = training_params['LEARNING_RATE']
+        WEIGHT_DECAY = training_params['WEIGHT_DECAY']
+        EARLY_STOPPING_PATIENCE = training_params['EARLY_STOPPING_PATIENCE']
 
         model = self.model
-        X_train = self.features
-        Y_train = self.labels
+        device = self.device
 
-        # Define loss and optimizer
-        training_loss = torch.nn.BCEWithLogitsLoss()
-        opt = optim.Adam(model.parameters(), lr=3e-4, weight_decay=1e-5)
+        # Initialize wandb
+        wandb.init(project="Learning_MICP", config=training_params)        
+
+        # Prepare dataset
+        X_tensor = torch.from_numpy(self.features).float()
+        Y_tensor = torch.from_numpy(self.outputs).float()
+        P_tensor = torch.from_numpy(self.P_train['XX'][:,:2,:]).float()
+        full_dataset = TensorDataset(X_tensor, Y_tensor, P_tensor)
+
+        # Split into train/validation
+        num_total = len(full_dataset)
+        num_train = int(0.9*num_total)
+        train_dataset = TensorDataset(X_tensor[:num_train], Y_tensor[:num_train], P_tensor[:num_train])
+        val_dataset   = TensorDataset(X_tensor[num_train:], Y_tensor[num_train:], P_tensor[num_train:])
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=TEST_BATCH_SIZE, shuffle=False)
+
+        # Loss and optimizer
+        loss_fn = nn.BCEWithLogitsLoss()
+        optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        best_val_loss = float('inf')
+        epochs_since_improvement = 0
 
         itr = 1
-        for epoch in range(TRAINING_EPOCHS):  # loop over the dataset multiple times
-            t0 = time.time()
+        for epoch in range(TRAINING_EPOCHS):
+            model.train()
             running_loss = 0.0
-            rand_idx = list(np.arange(0,X_train.shape[0]-1))
-            random.shuffle(rand_idx)
-
-            # Sample all data points
-            indices = [rand_idx[ii * BATCH_SIZE:(ii + 1) * BATCH_SIZE] for ii in range((len(rand_idx) + BATCH_SIZE - 1) // BATCH_SIZE)]
-
-            for ii, idx in enumerate(indices):
-                # zero the parameter gradients
-                opt.zero_grad()
-
-                inputs = Variable(torch.from_numpy(X_train[idx,:])).float().to(device=self.device)
-                y_true = Variable(torch.from_numpy(Y_train[idx,:])).float().to(device=self.device)
-
-                # forward + backward + optimize
-                outputs = model(inputs)
-                loss = training_loss(outputs, y_true).float().to(device=self.device)
+            for inputs, y_true, _ in train_loader:
+                inputs = inputs.to(device)
+                y_true = y_true.to(device)
+                optimizer.zero_grad()
+                logits = model(inputs)
+                loss = loss_fn(logits, y_true)
                 loss.backward()
-                opt.step()
-
-                # print statistics\n",
+                optimizer.step()
                 running_loss += loss.item()
-                if itr % CHECKPOINT_AFTER == 0:
-                    rand_idx = list(np.arange(0,X_train.shape[0]-1))
-                    random.shuffle(rand_idx)
-                    test_inds = rand_idx[:TEST_BATCH_SIZE]
-                    inputs = Variable(torch.from_numpy(X_train[test_inds,:])).float().to(device=self.device)
-                    y_out = Variable(torch.from_numpy(Y_train[test_inds])).float().to(device=self.device)
-
-                    # forward + backward + optimize
-                    outputs = model(inputs)
-                    loss = training_loss(outputs, y_out).float().to(device=self.device)
-                    outputs = Sigmoid()(outputs).round()
-                    accuracy = [float(all(torch.eq(outputs[ii],y_out[ii]))) for ii in range(TEST_BATCH_SIZE)]
-                    accuracy = np.mean(accuracy)
-                    verbose and print("loss:   " + str(loss.item()) + " , acc: " + str(accuracy))
-
-                if itr % SAVEPOINT_AFTER == 0:
-                    torch.save(model.state_dict(), self.model_fn)
-                    verbose and print('Saved model at {}'.format(self.model_fn))
-                    # writer.add_scalar('Loss/train', running_loss, epoch)
-
+                wandb.log({"train_loss": loss.item(), "iteration": itr})
                 itr += 1
-            # verbose and print('Done with epoch {} in {}s'.format(epoch, time.time()-t0))
+
+            avg_train_loss = running_loss / len(train_loader)
+            # Log to wandb
+            wandb.log({"avg_train_loss": avg_train_loss, "epoch": epoch})
+            
+            if epoch % SAVEPOINT_AFTER == 0:
+                torch.save(model.state_dict(), self.model_fn)
+                if verbose:
+                    print(f"[Epoch {epoch}], [Iter {itr}] Saved model at {self.model_fn}")
+
+            if epoch % CHECKPOINT_AFTER == 0:
+                # Evaluate on validation set
+                model.eval()
+                with torch.no_grad():
+                    val_loss_total = 0
+                    val_cons_violation = []
+                    bitwise_accs = []
+
+                    for val_inputs, val_targets, val_params in val_loader:
+                        # Get the loss values
+                        val_inputs = val_inputs.to(device)
+                        val_targets = val_targets.to(device)
+                        val_params = val_params.to(device)
+                        val_logits = model(val_inputs)
+                        val_loss = loss_fn(val_logits, val_targets)
+                        val_loss_total += val_loss.item()
+
+                        val_preds = val_logits.int() # Already rounded by STE_Round
+                        # Compare accuracy
+                        bitwise_accs.append(compute_bitwise_accuracy(val_preds, val_targets.int()))
+
+                        # Evaluate constraint violation
+                        constraint_loss = self.batch_constraint_violation_loss(val_preds, val_params).item()
+                        val_cons_violation.append(constraint_loss)
+
+                    avg_val_loss = val_loss_total/len(val_loader)
+                    avg_bitwise_acc = np.mean(bitwise_accs)
+                    avg_val_cons_violation = np.mean(val_cons_violation)
+
+                    if verbose:
+                        print(f"[Epoch {epoch}], [Iter {itr}] Validation loss: {avg_val_loss:.4f} | "
+                            f"Validation accuracy (bitwise): {avg_bitwise_acc:.4f} | "
+                            f"Constraint violation: {avg_val_cons_violation:.4f}")
+                    
+                    # Log to wandb
+                    wandb.log({"val/loss": avg_val_loss,
+                        "val/bitwise_acc": avg_bitwise_acc,
+                        "val/constraint_violation": avg_val_cons_violation,
+                        "epoch": epoch})
+
+                    # Check for early stopping
+                    if avg_val_loss < best_val_loss - 1e-3:
+                        best_val_loss = avg_val_loss
+                        epochs_since_improvement = 0
+                    else:
+                        epochs_since_improvement += 1
+                        if epochs_since_improvement >= EARLY_STOPPING_PATIENCE:
+                            print(f"Early stopping: no improvement for {EARLY_STOPPING_PATIENCE} epochs")
+                            torch.save(model.state_dict(), self.model_fn)
+                            wandb.save(self.model_fn)
+                            print(f"Final model saved at {self.model_fn}")
+                            wandb.finish()
+                            return  # Exit training early
 
         # Save final model
         torch.save(model.state_dict(), self.model_fn)
-        print('Saved model at {}'.format(self.model_fn))
-        print('Done training')
+        wandb.save(self.model_fn)
+        print(f"Final model saved at {self.model_fn}")
+        print("Done training.")
+        wandb.finish()
 
-"""
-Class to reproduce the model in
-https://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=9653847
-"""
-class CoCo:
-    
-    def __init__(self, prob_features, n_evals=10):
+    def batch_constraint_violation_loss(self, dis_traj_pred, cont_traj_pred, lambda_penalty=1.0):
         """
-        Constructor for CoCo class.
+        Compute the constraint violation as loss function for a batch data
         """
-        self.prob_features = prob_features
-        self.n_evals = n_evals
+        batch_size = dis_traj_pred.size(0)
+        total_violation = 0.0
+        for b in range(batch_size):
+            dis_traj = NNoutput_reshape_torch(dis_traj_pred[b], self.n_obs)
+            cont_traj = cont_traj_pred[b]
+            total_violation += constraint_violation_torch(dis_traj, cont_traj, self.Obs_info)
+        return lambda_penalty * total_violation / batch_size
 
-        self.num_train, self.num_test = 0, 0
-        self.model, self.model_fn = None, None
-
-    def construct_features(self, params, ii_obs=None):
-        prob_features = self.prob_features
-        feature_vec = np.array([])
-        x0, xg = params['x0'], params['xg'] 
-
-        for feature in prob_features:
-            if feature == "x0":
-                feature_vec = np.hstack((feature_vec, x0))
-            elif feature == "xg":
-                feature_vec = np.hstack((feature_vec, xg[:2]))
-            elif feature == "obstacles":
-                obstacles = params['obstacles']
-                feature_vec = np.hstack((feature_vec, np.reshape(obstacles, (4*self.n_obs))))
-            elif feature == "obstacles_map":
-                continue
-            else:
-                print('Feature {} is unknown'.format(feature))
-
-        # Append one-hot encoding to end
-        if ii_obs is not None:
-            one_hot = np.zeros(self.n_obs)
-            one_hot[ii_obs] = 1.
-            feature_vec = np.hstack((feature_vec, one_hot))
-
-        return feature_vec
-    
-    def construct_strategies(self, n_features, train_data):
+    # Train with self-supervised loss function
+    def SS_train(self, training_params, verbose=True, penalty_weight = 1.0):
         """
-        Reads in data and constructs strategy dictionary
+        Implement self-supervised learning with constraint violation based loss
+        penalty_weight: the penalty weight for constraint violation if linearly combine with supervised loss 
         """
-        self.n_features = n_features
-        self.strategy_dict = {}
-
-        self.X_train = train_data[0]
-        self.Y_train = train_data[3]
-        self.num_train = self.Y_train.shape[0]        
-
-        self.n_y = self.Y_train[0].size # will be the dimension of the output
-        self.y_shape = self.Y_train[0].shape
-        self.features = np.zeros((self.num_train, self.n_features))
-        self.labels = np.zeros((self.num_train, 1+self.n_y))
-        self.n_strategies = 0
-
-        for ii in range(self.num_train):
-            y_true = np.reshape(self.Y_train[ii,:,:], (self.n_y))
-
-            if tuple(y_true) not in self.strategy_dict.keys():
-                self.strategy_dict[tuple(y_true)] = np.hstack((self.n_strategies,np.copy(y_true)))
-                self.n_strategies += 1
-            self.labels[ii] = self.strategy_dict[tuple(y_true)]
-
-            prob_params = {}
-            for k in self.X_train:
-                prob_params[k] = self.X_train[k][ii]
-
-            self.features[ii] = self.construct_features(prob_params)
-
-    def setup_network(self, depth=3, neurons=32, device_id=0):
-        self.device = torch.device('cuda:{}'.format(device_id))
-        
-        ff_shape = [self.n_features]
-        for ii in range(depth):
-            ff_shape.append(neurons)
-
-        ff_shape.append(self.n_strategies)
-        self.model = FFNet(ff_shape, activation=torch.nn.ReLU()).to(device=self.device)
-
-        # file names for PyTorch models
-        now = datetime.now().strftime('%Y%m%d_%H%M')
-        model_fn = 'CoCo_{}.pt'
-        model_fn = os.path.join(os.getcwd(), model_fn)
-        self.model_fn = model_fn.format(now)
-
-    def load_network(self, fn_classifier_model):
-        if os.path.exists(fn_classifier_model):
-            print('Loading presaved classifier model from {}'.format(fn_classifier_model))
-            self.model.load_state_dict(torch.load(fn_classifier_model))
-            self.model_fn = fn_classifier_model
-
-    def train(self, training_params, verbose=True):
-        # grab training params
-        TRAINING_EPOCHS = training_params['TRAINING_EPOCHS']
         BATCH_SIZE = training_params['BATCH_SIZE']
+        TEST_BATCH_SIZE = training_params['TEST_BATCH_SIZE']
+        TRAINING_EPOCHS = training_params['TRAINING_EPOCHS']
         CHECKPOINT_AFTER = training_params['CHECKPOINT_AFTER']
         SAVEPOINT_AFTER = training_params['SAVEPOINT_AFTER']
-        TEST_BATCH_SIZE = training_params['TEST_BATCH_SIZE']
         LEARNING_RATE = training_params['LEARNING_RATE']
         WEIGHT_DECAY = training_params['WEIGHT_DECAY']
+        EARLY_STOPPING_PATIENCE = training_params['EARLY_STOPPING_PATIENCE']
 
         model = self.model
-        X = self.features; Y = self.labels[:,0]
-        nn = int(0.8*len(Y))
-        X_train = X[:nn, :]; Y_train = Y[:nn] 
-        X_valid = X[nn:, :]; Y_valid = Y[nn:] 
+        device = self.device
 
-        training_loss = torch.nn.CrossEntropyLoss()
-        opt = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        wandb.init(project="Learning_MICP", config=training_params)        
+
+        # Prepare dataset
+        X_tensor = torch.from_numpy(self.features).float()
+        Y_tensor = torch.from_numpy(self.outputs).float()
+        P_tensor = torch.from_numpy(self.P_train['XX'][:,:2,:]).float()
+        full_dataset = TensorDataset(X_tensor, Y_tensor, P_tensor)
+
+        # Split into train/val
+        num_total = len(full_dataset)
+        num_train = int(0.9*num_total)
+        train_dataset = TensorDataset(X_tensor[:num_train], Y_tensor[:num_train], P_tensor[:num_train])
+        val_dataset = TensorDataset(X_tensor[num_train:], Y_tensor[num_train:], P_tensor[num_train:])
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=TEST_BATCH_SIZE, shuffle=True)
+
+        # supervised loss and optimizer
+        loss_fn = nn.BCEWithLogitsLoss()
+        optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)        
+        best_val_loss = float('inf')
+        epochs_since_improvement = 0
 
         itr = 1
-        for epoch in range(TRAINING_EPOCHS):  # loop over the dataset multiple times
-            t0 = time.time()
+        for epoch in range(TRAINING_EPOCHS):
+            model.train()
             running_loss = 0.0
-            rand_idx = list(np.arange(X_train.shape[0]))
-            random.shuffle(rand_idx)
-
-            # Sample all data points
-            indices = [rand_idx[ii * BATCH_SIZE:(ii + 1) * BATCH_SIZE] for ii in range((len(rand_idx) + BATCH_SIZE - 1) // BATCH_SIZE)]
-
-            for ii,idx in enumerate(indices):
-                # zero the parameter gradients
-                opt.zero_grad()
-
-                inputs = Variable(torch.from_numpy(X_train[idx,:])).float().to(device=self.device)
-                labels = Variable(torch.from_numpy(Y_train[idx])).long().to(device=self.device)
-
-                # forward + backward + optimize
-                outputs = model(inputs)
-                loss = training_loss(outputs, labels).float().to(device=self.device)
-                class_guesses = torch.argmax(outputs,1)
-                accuracy = torch.mean(torch.eq(class_guesses,labels).float())
+            for inputs, y_true, params in train_loader:
+                inputs = inputs.to(device)
+                y_true = y_true.to(device)
+                params = params.to(device)
+                optimizer.zero_grad()
+                logits = model(inputs)  # shape: (B, N_obs*4*H)
+                loss = self.batch_constraint_violation_loss(logits, params, lambda_penalty=penalty_weight) # + loss_fn(logits, y_true)
                 loss.backward()
-                #torch.nn.utils.clip_grad_norm(model.parameters(),0.1)
-                opt.step()
-
-                # print statistics\n",
+                optimizer.step()
                 running_loss += loss.item()
-                if itr % CHECKPOINT_AFTER == 0:
-                    verbose and print("Training: loss:   "+str(loss.item())+",   acc:  "+str(accuracy.item()))
+                wandb.log({"train_loss": loss.item(), "iteration": itr})
+                itr += 1
+
+            avg_train_loss = running_loss / len(train_loader)
+            # Log to wandb
+            wandb.log({"avg_train_loss": avg_train_loss, "epoch": epoch})
+
+            if epoch % SAVEPOINT_AFTER == 0:
+                torch.save(model.state_dict(), self.model_fn)
+                if verbose:
+                    print(f"[Epoch {epoch}], [Iter {itr}] Saved model at {self.model_fn}")
+
+            if epoch % CHECKPOINT_AFTER == 0:
+                # Evaluate on validation set
+                model.eval()
+                with torch.no_grad():
+                    val_loss_total = 0
+                    val_cons_violation = []
+                    bitwise_accs = []
+
+                    for val_inputs, val_targets, val_params in val_loader:
+                        val_inputs = val_inputs.to(device)
+                        val_targets = val_targets.to(device)
+                        val_params = val_params.to(device)
+
+                        val_logits = model(val_inputs)
+                        val_loss = loss_fn(val_logits, val_targets) + self.batch_constraint_violation_loss(val_logits, val_params, lambda_penalty=penalty_weight)
+                        val_loss_total += val_loss.item()
+                        val_preds = val_logits.int() # Already rounded by STE_Round
+
+                        # Compare accuracy
+                        bitwise_accs.append(compute_bitwise_accuracy(val_preds, val_targets.int()))
+                        # Evaluate constraint violation
+                        constraint_loss = self.batch_constraint_violation_loss(val_preds, val_params).item()
+                        val_cons_violation.append(constraint_loss)
+
+                    avg_val_loss = val_loss_total/len(val_loader)
+                    avg_bitwise_acc = np.mean(bitwise_accs)
+                    avg_val_cons_violation = np.mean(val_cons_violation)
+
+                    if verbose:
+                        print(f"[Epoch {epoch}], [Iter {itr}] Validation loss: {avg_val_loss:.4f} | "
+                            f"Validation accuracy (bitwise): {avg_bitwise_acc:.4f} | "
+                            f"Constraint violation: {avg_val_cons_violation:.4f}")
+                    # Log to wandb
+                    wandb.log({"val/loss": avg_val_loss,
+                        "val/bitwise_acc": avg_bitwise_acc,
+                        "val/constraint_violation": avg_val_cons_violation,
+                        "epoch": epoch})
                     
-                    # Validate on different data (not used in training)
-                    rand_idx = list(np.arange(X_valid.shape[0]))
-                    random.shuffle(rand_idx)
-                    test_inds = rand_idx[:TEST_BATCH_SIZE]
-                    inputs = Variable(torch.from_numpy(X_valid[test_inds,:])).float().to(device=self.device)
-                    labels = Variable(torch.from_numpy(Y_valid[test_inds])).long().to(device=self.device)
-                    # forward + backward + optimize
-                    outputs = model(inputs)
-                    loss = training_loss(outputs, labels).float().to(device=self.device)
-                    class_guesses = torch.argmax(outputs,1)
-                    accuracy = torch.mean(torch.eq(class_guesses,labels).float())
-                    verbose and print("Validation: loss:   "+str(loss.item())+",   acc:  "+str(accuracy.item()))
+                    # Check for early stopping
+                    if avg_val_loss < best_val_loss - 1e-3:
+                        best_val_loss = avg_val_loss
+                        epochs_since_improvement = 0
+                    else:
+                        epochs_since_improvement += 1
+                        if epochs_since_improvement >= EARLY_STOPPING_PATIENCE:
+                            print(f"Early stopping: no improvement for {EARLY_STOPPING_PATIENCE} epochs")
+                            torch.save(model.state_dict(), self.model_fn)
+                            wandb.save(self.model_fn)
+                            print(f"Final model saved at {self.model_fn}")
+                            wandb.finish()
+                            return  # Exit training early
 
-                if itr % SAVEPOINT_AFTER == 0:
-                    torch.save(model.state_dict(), self.model_fn)
-                    verbose and print('Saved model at {}'.format(self.model_fn))
-                    # writer.add_scalar('Loss/train', running_loss, epoch)
-
-                itr += 1
-            # verbose and print('Done with epoch {} in {}s'.format(epoch, time.time()-t0))
-
+        # Save final model
         torch.save(model.state_dict(), self.model_fn)
-        print('Saved model at {}'.format(self.model_fn))
-
-        print('Done training')
-
-"""
-Class to reproduce the LSTM model in
-https://proceedings.mlr.press/v168/cauligi22a/cauligi22a.pdf
-"""
-class PRISM:
-
-    def __init__(self, prob_features, n_evals=10):
-        """
-        Constructor for PRISM class.
-        """
-        self.prob_features = prob_features
-        self.n_evals = n_evals
-
-        self.num_train, self.num_test = 0, 0
-        self.model, self.model_fn = None, None
-        
-    def construct_features(self, params, ii_obs=None):
-        prob_features = self.prob_features
-        feature_vec = np.array([])
-        x0, xg = params['x0'], params['xg'] 
-
-        for feature in prob_features:
-            if feature == "x0":
-                feature_vec = np.hstack((feature_vec, x0))
-            elif feature == "xg":
-                feature_vec = np.hstack((feature_vec, xg[:2]))
-            elif feature == "obstacles":
-                obstacles = params['obstacles']
-                feature_vec = np.hstack((feature_vec, np.reshape(obstacles, (4*self.n_obs))))
-            elif feature == "obstacles_map":
-                continue
-            else:
-                print('Feature {} is unknown'.format(feature))
-
-        # Append one-hot encoding to end
-        if ii_obs is not None:
-            one_hot = np.zeros(self.n_obs)
-            one_hot[ii_obs] = 1.
-            feature_vec = np.hstack((feature_vec, one_hot))
-
-        return feature_vec   
-    
-    def construct_strategies(self, n_features, train_data):
-        """
-        Reads in data and constructs strategy dictionary
-        """
-        self.n_features = n_features
-        self.strategy_dict = {}
-
-        self.X_train = train_data[0]
-        self.Y_train = train_data[3]
-        self.num_train = self.Y_train.shape[0]        
-
-        self.n_y = self.Y_train[0].shape[0] # will be the dimension of the output
-        self.H = self.Y_train[0].shape[1]
-        self.features = np.zeros((self.num_train, self.n_features))
-        self.labels = np.zeros((self.num_train, self.H, 1+self.n_y))
-        self.n_strategies = 0
-        n_str_max = 2**self.n_y # maximum number of strategies
-
-        for ii in range(self.num_train):
-            for hh in range(self.H):
-                y_true = self.Y_train[ii,:,hh]
-                if not self.n_strategies >= n_str_max:
-                    # check if y_true is not in strategy_dict
-                    if tuple(y_true) not in self.strategy_dict.keys():
-                        self.strategy_dict[tuple(y_true)] = np.hstack((self.n_strategies, np.copy(y_true)))
-                        self.n_strategies += 1
-            
-                self.labels[ii][hh] = self.strategy_dict[tuple(y_true)]
-
-            prob_params = {}
-            for k in self.X_train:
-                prob_params[k] = self.X_train[k][ii]
-
-            self.features[ii] = self.construct_features(prob_params)    
-
-    def setup_network(self, ff_neurons=256, lstm_neurons=128, lstm_lay = 3, device_id=0):
-        self.device = torch.device('cuda:{}'.format(device_id))
-
-        net_shape = [self.n_features, ff_neurons, lstm_neurons, self.n_strategies]
-        self.model = LSTMNet(net_shape, lstm_lay, activation=torch.nn.ReLU()).to(device=self.device)
-
-        # file names for PyTorch models
-        now = datetime.now().strftime('%Y%m%d_%H%M')
-        model_fn = 'PRISM_{}.pt'
-        model_fn = os.path.join(os.getcwd(), model_fn)
-        self.model_fn = model_fn.format(now)
-
-    def load_network(self, fn_classifier_model):
-        if os.path.exists(fn_classifier_model):
-            print('Loading presaved classifier model from {}'.format(fn_classifier_model))
-            self.model.load_state_dict(torch.load(fn_classifier_model))
-            self.model_fn = fn_classifier_model
-
-    def train(self, training_params, verbose=True):
-        # grab training params
-        TRAINING_EPOCHS = training_params['TRAINING_EPOCHS']
-        BATCH_SIZE = training_params['BATCH_SIZE']
-        CHECKPOINT_AFTER = training_params['CHECKPOINT_AFTER']
-        SAVEPOINT_AFTER = training_params['SAVEPOINT_AFTER']
-        TEST_BATCH_SIZE = training_params['TEST_BATCH_SIZE']
-        LEARNING_RATE = training_params['LEARNING_RATE']
-        WEIGHT_DECAY = training_params['WEIGHT_DECAY']
-
-        model = self.model
-        X = self.features; Y = self.labels[:,:,0]
-        nn = int(0.8*len(Y))
-        X_train = X[:nn, :]; Y_train = Y[:nn, :] 
-        X_valid = X[nn:, :]; Y_valid = Y[nn:, :] 
-
-        training_loss = torch.nn.CrossEntropyLoss()
-        opt = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-        itr = 1
-        for epoch in range(TRAINING_EPOCHS):  # loop over the dataset multiple times
-            running_loss = 0.0
-            rand_idx = list(np.arange(X_train.shape[0]))
-            random.shuffle(rand_idx)
-
-            # Sample all data points
-            indices = [rand_idx[ii * BATCH_SIZE:(ii + 1) * BATCH_SIZE] for ii in range((len(rand_idx) + BATCH_SIZE - 1) // BATCH_SIZE)]
-            for ii,idx in enumerate(indices):
-                # zero the parameter gradients
-                opt.zero_grad()
-
-                inputs = Variable(torch.from_numpy(X_train[idx,:])).float().to(device=self.device)
-                ip_shape = inputs.shape
-                inputs = inputs.unsqueeze(1).expand(ip_shape[0], self.H, self.n_features)
-                labels = Variable(torch.from_numpy(Y_train[idx,:])).long().to(device=self.device)
-
-                # forward + backward + optimize
-                outputs = model(inputs)
-                loss = training_loss(outputs.permute(0, 2, 1), labels).float().to(device=self.device)
-                class_guesses = torch.argmax(outputs, 2)
-                accuracy = torch.mean(torch.all(torch.eq(class_guesses, labels), axis=1).float())
-                loss.backward()
-                #torch.nn.utils.clip_grad_norm(model.parameters(),0.1)
-                opt.step()
-
-                # print statistics\n",
-                running_loss += loss.item()
-                if itr % CHECKPOINT_AFTER == 0:
-                    verbose and print("Training: loss:   "+str(loss.item())+",   acc:  "+str(accuracy.item()))
-
-                    # Validate on different data (not used in training)
-                    rand_idx = list(np.arange(X_valid.shape[0]))
-                    random.shuffle(rand_idx)
-                    test_inds = rand_idx[:TEST_BATCH_SIZE]
-                    inputs = Variable(torch.from_numpy(X_valid[test_inds,:])).float().to(device=self.device)
-                    inputs = inputs.unsqueeze(1).expand(TEST_BATCH_SIZE, self.H, self.n_features)
-                    labels = Variable(torch.from_numpy(Y_valid[test_inds])).long().to(device=self.device)
-
-                    # forward + backward + optimize
-                    outputs = model(inputs)
-                    loss = training_loss(outputs.permute(0, 2, 1), labels).float().to(device=self.device)
-                    class_guesses = torch.argmax(outputs,2)
-                    accuracy = torch.mean(torch.all(torch.eq(class_guesses, labels), axis=1).float())
-                    verbose and print("Validation: loss:   "+str(loss.item())+",   acc:  "+str(accuracy.item()))
-
-                if itr % SAVEPOINT_AFTER == 0:
-                    torch.save(model.state_dict(), self.model_fn)
-                    verbose and print('Saved model at {}'.format(self.model_fn))
-                    # writer.add_scalar('Loss/train', running_loss, epoch)
-
-                itr += 1
-            # verbose and print('Done with epoch {} in {}s'.format(epoch, time.time()-t0))
-
-        torch.save(model.state_dict(), self.model_fn)
-        print('Saved model at {}'.format(self.model_fn))
-
-        print('Done training')
+        wandb.save(self.model_fn)
+        print(f"Final model saved at {self.model_fn}")
+        print("Done training.")
+        wandb.finish()
