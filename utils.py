@@ -94,12 +94,42 @@ def NNoutput_reshape(outputs, N_obs):
     return dis_traj
 
 # torch version of the function above
+# def NNoutput_reshape_torch(outputs: torch.Tensor, N_obs: int):
+#     if outputs.dim() == 1:
+#         outputs = outputs.view(N_obs, -1) # (N_obs, 4*H)
+#     H = outputs.shape[1] // 4
+#     # reshape to (N_obs, H, 4) in C-order
+#     dis_traj = outputs.view(N_obs, H, 4)
+#     # transpose to (N_obs, 4, H) to match NumPy's F-order reshape
+#     dis_traj = dis_traj.transpose(1, 2).contiguous()
+#     return dis_traj
+
+# torch version of the function above
 def NNoutput_reshape_torch(outputs: torch.Tensor, N_obs: int):
+    """Reshape NN outputs to (N_obs, 4, H) or (B, N_obs, 4, H)."""
     if outputs.dim() == 1:
-        outputs = outputs.view(N_obs, -1) # (N_obs, 4*H)
-    H = outputs.shape[1] // 4
-    # reshape to (N_obs, H, 4) in C-order
-    dis_traj = outputs.view(N_obs, H, 4)
-    # transpose to (N_obs, 4, H) to match NumPy's F-order reshape
-    dis_traj = dis_traj.transpose(1, 2).contiguous()
-    return dis_traj
+        total_dim = outputs.numel()
+        if total_dim % (4 * N_obs) != 0:
+            raise ValueError("Output length not divisible by expected obstacle/bin count")
+        outputs = outputs.view(N_obs, -1)
+        H = outputs.shape[1] // 4
+        dis_traj = outputs.view(N_obs, H, 4).transpose(1, 2).contiguous()
+        return dis_traj
+
+    if outputs.dim() == 2:
+        batch = outputs.size(0)
+        total_dim = outputs.size(1)
+        if total_dim % (4 * N_obs) != 0:
+            raise ValueError("Output length not divisible by expected obstacle/bin count")
+        outputs = outputs.view(batch, N_obs, -1)
+        H = outputs.size(2) // 4
+        dis_traj = outputs.view(batch, N_obs, H, 4).transpose(2, 3).contiguous()
+        return dis_traj
+
+    if outputs.dim() == 3 and outputs.size(1) == 4:
+        return outputs
+
+    if outputs.dim() == 4 and outputs.size(2) == 4:
+        return outputs
+
+    raise ValueError("Unexpected output shape for NNoutput_reshape_torch")
