@@ -8,3 +8,4 @@ data/
 wandb
 wandb/
 self_supervised/wandb/
+L2O_MIQP.egg-info/
