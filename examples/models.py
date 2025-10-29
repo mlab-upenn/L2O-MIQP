@@ -1,84 +1,294 @@
+
 import torch
 import torch.nn as nn
+import numpy as np
+import cvxpy as cp
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
+import wandb
 
-# STE_Round operator; see https://arxiv.org/pdf/1308.3432
-class STE_Round(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-        return torch.round(x)
+# Define some penalty functions that we may use
+l1_penalty = lambda s: s.sum(dim=1)
+l2_penalty = lambda s: (s**2).sum(dim=1)
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output
-
-class Simple_MLP(nn.Module):
+def combined_loss_fcn(loss_components, weights):
     """
-    Just a Simple Multi-Layer Perceptron.
+    Combine multiple loss components with given weights.
     """
-    def __init__(self, insize, outsize, bias=True, linear_map=nn.Linear,
-        nonlin=nn.ReLU(), hsizes=[64], linargs=None):
-        super().__init__()
-        if linargs is None:
-            linargs = {}
+    assert len(loss_components) == len(weights), "Number of loss components must match number of weights."
+    combined_loss = sum(w * lc for w, lc in zip(weights, loss_components))
+    return combined_loss
 
-        self.in_features, self.out_features = insize, outsize
-        sizes = [insize] + hsizes + [outsize]
+class SSL_MIQP_incorporated:
 
-        # Define layers
-        self.linear = nn.ModuleList([
-            linear_map(sizes[i], sizes[i+1], bias=bias, **linargs)
-            for i in range(len(sizes) - 1)
-        ])
-
-        self.nonlin = nn.ModuleList(
-            [nonlin() for _ in range(len(hsizes))] + [nn.Identity()]
-        )
-
-    def forward(self, x):
+    def __init__(self, nn_model, cvx_layer, nx, ny, device=None):
         """
-        Forward pass through the network
+        Initialize the SSL_MIQP model.
+        Args:
+            nn_model: The neural network model.
+            cvx_layer: The CVXPY layer for optimization.
+            nx: Number of input features.
+            ny: Number of output features.
+            device: The device (CPU or GPU).    
         """
-        for lin, act in zip(self.linear, self.nonlin):
-            x = act(lin(x))
-        return x
+        self.nn_model = nn_model
+        self.cvx_layer = cvx_layer
+        self.nx, self.ny = nx, ny
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = device
 
-class MLPWithSTE(nn.Module):
-    """
-    Multi-Layer Perceptron with STE rounding operator on output.
-    """
-    def __init__(self, insize, outsize, bias=True, linear_map=nn.Linear,
-        nonlin=nn.ReLU(), hsizes=[64], linargs=None):
-        super().__init__()
-        if linargs is None:
-            linargs = {}
-
-        self.in_features, self.out_features = insize, outsize
-        sizes = [insize] + hsizes + [outsize]
-
-        # Define layers
-        self.linear = nn.ModuleList([
-            linear_map(sizes[i], sizes[i+1], bias=bias, **linargs)
-            for i in range(len(sizes) - 1)
-        ])
-
-        self.nonlin = nn.ModuleList(
-            [nonlin() for _ in range(len(hsizes))] + [nn.Identity()]
-        )
-
-    def reg_error(self):
+    def train_SL(self, ground_truth_solver, train_loader, test_loader, training_params, wandb_log = False):
         """
-        Optional L2 regularization hook if using custom linear layers with `reg_error()`.
+        Train the neural network model using supervised learning.
+        Args:
+            ground_truth_solver: Function to get ground truth solutions.
+            train_loader: DataLoader for training data.
+            test_loader: DataLoader for testing data.
+            training_params: Dictionary containing training parameters.
+            wandb_log: Boolean indicating whether to log to Weights & Biases.
         """
-        return sum(
-            [layer.reg_error() for layer in self.linear if hasattr(layer, "reg_error")]
-        )
+        TRAINING_EPOCHS = training_params['TRAINING_EPOCHS']
+        CHECKPOINT_AFTER = training_params['CHECKPOINT_AFTER']
+        LEARNING_RATE = training_params['LEARNING_RATE']
+        WEIGHT_DECAY = training_params['WEIGHT_DECAY']
+        PATIENCE = training_params['PATIENCE']
+        # Put all layers in device
+        device = self.device
+        self.nn_model.to(device)
 
-    def forward(self, x):
+        # Initialize training components
+        global_step = 0
+        optimizer = torch.optim.Adam(self.nn_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=int(PATIENCE/2))
+        supervised_loss_fn = nn.HuberLoss() # supervised loss function 
+        best_val_loss = float("inf") # Store best validation 
+        epochs_no_improve = 0  # Count epochs with no improvement  
+        if wandb_log: wandb.init(
+            project=training_params.get("WANDB_PROJECT", "supervised_learning"),
+            name=training_params.get("RUN_NAME", None),
+            config=training_params
+        )    
+
+        for epoch in range(1, TRAINING_EPOCHS+1):
+            self.nn_model.train()
+            for batch in train_loader:
+                theta = batch.to(device)
+                B = theta.shape[0] # batch size
+                # ---- Predict y from theta ----
+                y_pred = self.nn_model(theta).float() # (B, ny), hard {0,1}
+                # May need it to include a supervised loss function 
+                x_solver, y_solver = ground_truth_solver(theta)
+                supervised_loss = supervised_loss_fn(y_pred, y_solver.float())
+                loss = supervised_loss
+                if wandb_log: wandb.log({
+                    "train/loss": loss.item(),
+                    "step": global_step})
+                # ---- Backprop ----
+                optimizer.zero_grad()
+                loss.backward()
+                # torch.nn.utils.clip_grad_norm_(nn_model.parameters(), max_norm=1e1)
+                optimizer.step()
+                global_step += 1
+                
+                # ---- Logging ----
+                if global_step == 1 or (global_step % CHECKPOINT_AFTER) == 0:
+                    training_loss = loss.item()
+                    val_loss_total = 0.0
+                    with torch.no_grad():
+                        for val_batch in test_loader:
+                            theta = val_batch.to(device)
+                            # ---- Predict y from theta ----
+                            y_pred_test = self.nn_model(theta).float() # (B, ny), hard {0,1}
+                            _, y_solver_test = ground_truth_solver(theta)
+                            val_loss_total += supervised_loss_fn(y_pred_test, y_solver_test).item()                           
+                        avg_val_loss = val_loss_total / len(test_loader)
+
+                    print(f"[epoch {epoch} | step {global_step}] "
+                        f"training loss = {training_loss:.4f}, "
+                        f"validation loss = {avg_val_loss:.4f}")
+                    # --- Log losses to wandb ---
+                    if wandb_log: wandb.log({
+                        "val/loss": avg_val_loss,
+                        "epoch": epoch})
+
+                    # Check if need to update the learning rates
+                    last_lr = optimizer.param_groups[0]['lr']
+                    scheduler.step(loss.item())
+                    current_lr = optimizer.param_groups[0]['lr']
+                    if current_lr != last_lr:
+                        print(f"Learning rate updated: {last_lr:.6f} -> {current_lr:.6f}")
+                        last_lr = current_lr
+
+                    if avg_val_loss < best_val_loss:
+                        best_val_loss = avg_val_loss
+                        epochs_no_improve = 0
+                    else:
+                        epochs_no_improve += 1
+                        if epochs_no_improve >= PATIENCE:
+                            print("Early stopping triggered!")
+                            return
+        if wandb_log: wandb.finish()
+                    
+    def train_SSL(self, ground_truth_solver, train_loader, test_loader, training_params, loss_weights, 
+            obj_fcn = lambda: 0, y_cons = [], slack_penalty = l1_penalty, constraint_penalty = torch.relu, 
+            wandb_log = False):
         """
-        Forward pass through the network with STE rounding at the end.
+        Train the neural network model using self-supervised learning.
+        Args:
+            ground_truth_solver: Function to get ground truth solutions.
+            train_loader: DataLoader for training data.
+            test_loader: DataLoader for testing data.
+            training_params: Dictionary containing training parameters.
+            loss_weights: List of weights for different loss components.
+            obj_fcn: Function to compute objective value given (x, y).
+            y_cons: List of functions to compute constraint violations only on y (integer variables).
+            slack_penalty: Function to compute penalty on slack variables.
+            constraint_penalty: Function to compute penalty on constraint violations.
+            wandb_log: Boolean indicating whether to log to Weights & Biases.
         """
-        for lin, act in zip(self.linear, self.nonlin):
-            x = act(lin(x))
-        probs = torch.sigmoid(x)
-        hard_output = STE_Round.apply(probs)
-        return hard_output
+        TRAINING_EPOCHS = training_params['TRAINING_EPOCHS']
+        CHECKPOINT_AFTER = training_params['CHECKPOINT_AFTER']
+        LEARNING_RATE = training_params['LEARNING_RATE']
+        WEIGHT_DECAY = training_params['WEIGHT_DECAY']
+        PATIENCE = training_params['PATIENCE']
+
+        # Put all layers in device
+        device = self.device
+        self.nn_model.to(device)
+        self.cvx_layer.cvxpylayer.to(device)
+
+        # Define weights for loss components
+        weights = torch.tensor(loss_weights, device=device)
+        weights = 1e1*weights / weights.sum() # may scale up the weights a bit
+        global_step = 0
+        optimizer = torch.optim.Adam(self.nn_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=int(PATIENCE/2))
+        supervised_loss_fn = nn.HuberLoss() 
+        best_val_loss = float("inf") # Store best validation 
+        epochs_no_improve = 0  # Count epochs with no improvement 
+
+        if wandb_log: wandb.init(
+            project=training_params.get("WANDB_PROJECT", "self_supervised_learning"),
+            name=training_params.get("RUN_NAME", None),
+            config=training_params
+        )     
+               
+        for epoch in range(1, TRAINING_EPOCHS+1):
+            self.nn_model.train()
+            for batch in train_loader:
+                theta = batch.to(device)
+                B = theta.shape[0] # batch size
+                # ---- Predict y from theta ----
+                y_pred = self.nn_model(theta).float() # (B, ny), hard {0,1}
+                # ---- Solve convex subproblem given y ----
+                # CVXPYLayer supports autograd; keep inputs requiring grad if needed
+                x_opt, s_opt = self.cvx_layer.solve(theta, y_pred)
+                # May need it to include a supervised loss function 
+                x_solver, y_solver = ground_truth_solver(theta)
+                supervised_loss = supervised_loss_fn(y_pred, y_solver.float())
+                obj_val = obj_fcn(x_opt, y_pred, theta).mean()
+                # Slack penalty, for constraint violation of the ones involving continuous decision variables
+                slack_pen = slack_penalty(s_opt).mean()
+                # Violation penalty for constraint violation only on the integer decision variables
+                y_constraint = [f(y_pred, theta) for f in y_cons] # list of Mx1 tensors
+                y_constraint = torch.stack(y_constraint) # shape: (num_constraints, batch_size)
+                y_penalty = constraint_penalty(y_constraint).mean()
+                # Total loss with balanced weights
+                loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
+                if wandb_log: wandb.log({
+                    "train/combined_loss": loss.item(),
+                    "train/obj_val": obj_val.item(),
+                    "train/slack_pen": slack_pen.item(),
+                    "train/y_sum_penalty": y_penalty.item(),
+                    "train/supervised_loss": supervised_loss.item(),
+                    "step": global_step})
+
+                # ---- Backprop ----
+                optimizer.zero_grad()
+                loss.backward()
+                # torch.nn.utils.clip_grad_norm_(nn_model.parameters(), max_norm=1e1)
+                optimizer.step()         
+                global_step += 1
+
+                # ---- Logging ----
+                if global_step == 1 or (global_step % CHECKPOINT_AFTER) == 0:
+                    val_loss_total = []; obj_val_total = []; opt_obj_val_total = []
+                    slack_pen_total = []; y_penalty_total = []
+                    supervised_loss_total = []
+                    with torch.no_grad():
+                        for val_batch in test_loader:
+                            theta = val_batch.to(device)
+                            # ---- Predict y from theta ----
+                            y_pred = self.nn_model(theta).float() # (B, ny), hard {0,1}
+                            # ---- Solve convex subproblem given y ----
+                            x_opt, s_opt = self.cvx_layer.solve(theta, y_pred)
+                            # May need it to include a supervised loss function 
+                            x_solver, y_solver = ground_truth_solver(theta)
+                            supervised_loss = supervised_loss_fn(y_pred, y_solver.float())
+                            obj_val = obj_fcn(x_opt, y_pred, theta).mean()
+                            opt_obj_val = obj_fcn(x_solver, y_solver, theta).mean()
+                            # Slack penalty, for constraint violation of the ones involving continuous decision variables
+                            slack_pen = slack_penalty(s_opt).mean()
+                            # Violation penalty for constraint violation only on the integer decision variables
+                            y_constraint = [f(y_pred, theta) for f in y_cons]
+                            y_constraint = torch.stack(y_constraint) # shape: (num_constraints, batch_size, ...)
+                            y_penalty = constraint_penalty(y_constraint).mean()
+                            # Total loss with balanced weights
+                            loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
+
+                            # Collect loss values
+                            val_loss_total.append(loss.item())       
+                            obj_val_total.append(obj_val.item())
+                            opt_obj_val_total.append(opt_obj_val.item())
+                            slack_pen_total.append(slack_pen.item())
+                            y_penalty_total.append(y_penalty.item())
+                            supervised_loss_total.append(supervised_loss.item())
+
+                        # Compute the averages
+                        avg_val_loss = torch.mean(torch.tensor(val_loss_total))
+                        avg_obj_val = torch.mean(torch.tensor(obj_val_total))
+                        avg_opt_obj_val = torch.mean(torch.tensor(opt_obj_val_total))
+                        avg_slack_pen = torch.mean(torch.tensor(slack_pen_total))
+                        avg_y_penalty = torch.mean(torch.tensor(y_penalty_total))
+                        avg_supervised_loss = torch.mean(torch.tensor(supervised_loss_total))
+
+                    print(f"[epoch {epoch} | step {global_step}] "
+                        f"validation: loss = {avg_val_loss:.4f}, "
+                        f"obj_val = {avg_obj_val:.4f}, "
+                        f"opt_obj_val = {avg_opt_obj_val:.4f}, "
+                        f"slack_pen = {avg_slack_pen:.4f}, "
+                        f"y_sum_penalty = {avg_y_penalty:.4f}, "
+                        f"supervised_loss = {avg_supervised_loss:.4f}, ")
+                    # --- Log losses to wandb ---
+                    if wandb_log: wandb.log({
+                        "val/avg_loss": avg_val_loss,
+                        "val/obj_val": avg_obj_val,
+                        "val/slack_pen": avg_slack_pen,
+                        "val/y_sum_penalty": avg_y_penalty,
+                        "val/supervised_loss": avg_supervised_loss,
+                        "epoch": epoch})       
+
+                    # Check if need to update the learning rates
+                    last_lr = optimizer.param_groups[0]['lr']
+                    scheduler.step(loss.item())
+                    current_lr = optimizer.param_groups[0]['lr']
+                    if current_lr != last_lr:
+                        print(f"Learning rate updated: {last_lr:.6f} -> {current_lr:.6f}")
+                        last_lr = current_lr
+                    # Early stopping check
+                    if avg_val_loss < best_val_loss:
+                        best_val_loss = avg_val_loss
+                        epochs_no_improve = 0
+                    else:
+                        epochs_no_improve += 1
+                        if epochs_no_improve >= PATIENCE:
+                            print("Early stopping triggered!")
+                            return          
+                    # # Stop if constraint violations are small enough
+                    # if slack_pen.item() < 1e-4 and y_sum_penalty < 1e-4:
+                    #     print("Slack penalty below threshold, stopping training.")
+                    #     return
+
+        if wandb_log: wandb.finish()                        
