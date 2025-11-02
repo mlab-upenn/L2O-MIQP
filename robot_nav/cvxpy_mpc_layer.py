@@ -53,7 +53,7 @@ def build_mpc_cvxpy_layer(
     d_min: float,
     obstacles: Sequence,
     coupling_pairs: Iterable[Tuple[int, int]],
-    big_m: float = 1e3,
+    big_m: float = 1e2,
 ) -> Tuple[CvxpyLayer, dict]:
     """
     Construct a CVXPYLayer that solves the continuous relaxation of the MIQP.
@@ -84,7 +84,9 @@ def build_mpc_cvxpy_layer(
     Returns
     -------
     layer : cvxpylayers.torch.CvxpyLayer
-        Layer that maps parameters to optimal continuous trajectories.
+        Layer that maps parameters to optimal continuous trajectories. Returns
+        the control/state trajectories along with slack variables that relax the
+        integer-activated constraints.
     meta : dict
         Metadata describing parameter ordering and dimensions for future calls.
     """
@@ -101,6 +103,7 @@ def build_mpc_cvxpy_layer(
     P = cp.Variable((num_states, horizon_vars))
     V = cp.Variable((num_states, horizon_vars))
     U = cp.Variable((num_states, H))
+    S_obs = cp.Variable((num_obs, M, H, 4), nonneg=True)
 
     # Parameters that will be passed in at solve time.
     p0 = cp.Parameter(num_states)
@@ -112,9 +115,11 @@ def build_mpc_cvxpy_layer(
     if num_pairs > 0:
         bb_param = cp.Parameter((num_pairs, H))
         cc_param = cp.Parameter((num_pairs, H))
+        S_pairs = cp.Variable((num_pairs, H, 4), nonneg=True)
     else:
         bb_param = None
         cc_param = None
+        S_pairs = None
 
     constraints = []
 
@@ -160,12 +165,16 @@ def build_mpc_cvxpy_layer(
             py = P[2 * m + 1, 1:]
             constraints += [
                 cth * (px - xo[obs_idx]) + sth * (py - yo[obs_idx])
+                + S_obs[obs_idx, m, :, 0]
                 >= L0[obs_idx] - big_m * obs_binary_param[obs_idx, m, :, 0],
                 -sth * (px - xo[obs_idx]) + cth * (py - yo[obs_idx])
+                + S_obs[obs_idx, m, :, 1]
                 >= W0[obs_idx] - big_m * obs_binary_param[obs_idx, m, :, 1],
                 -cth * (px - xo[obs_idx]) - sth * (py - yo[obs_idx])
+                + S_obs[obs_idx, m, :, 2]
                 >= L0[obs_idx] - big_m * obs_binary_param[obs_idx, m, :, 2],
                 sth * (px - xo[obs_idx]) - cth * (py - yo[obs_idx])
+                + S_obs[obs_idx, m, :, 3]
                 >= W0[obs_idx] - big_m * obs_binary_param[obs_idx, m, :, 3],
             ]
 
@@ -180,18 +189,31 @@ def build_mpc_cvxpy_layer(
             cc = cc_param[pair_idx, :]
 
             constraints += [
-                px_m - px_n >= 2 * d_min - big_m * (bb + cc),
-                px_n - px_m >= 2 * d_min - big_m * (1 - bb + cc),
-                py_m - py_n >= 2 * d_min - big_m * (1 + bb - cc),
-                py_n - py_m >= 2 * d_min - big_m * (2 - bb - cc),
+                px_m - px_n + S_pairs[pair_idx, :, 0]
+                >= 2 * d_min - big_m * (bb + cc),
+                px_n - px_m + S_pairs[pair_idx, :, 1]
+                >= 2 * d_min - big_m * (1 - bb + cc),
+                py_m - py_n + S_pairs[pair_idx, :, 2]
+                >= 2 * d_min - big_m * (1 + bb - cc),
+                py_n - py_m + S_pairs[pair_idx, :, 3]
+                >= 2 * d_min - big_m * (2 - bb - cc),
             ]
 
     # Objective mirrors the original quadratic cost.
-    objective = cp.Minimize(
+    slack_penalty = 1e4
+    slack_cost = slack_penalty * cp.sum(S_obs)
+    if S_pairs is not None:
+        slack_cost += slack_penalty * cp.sum(S_pairs)
+
+    objective_expr = (
         Wu * cp.sum_squares(U)
         + Wp * cp.sum_squares(P[:, :H] - goal_column)
         + Wpt * cp.sum_squares(P[:, -1] - goals)
+        + slack_cost
     )
+    obj_value = cp.Variable()
+    constraints.append(objective_expr <= obj_value)
+    objective = cp.Minimize(obj_value)
 
     problem = cp.Problem(objective, constraints)
 
@@ -199,7 +221,11 @@ def build_mpc_cvxpy_layer(
     if num_pairs > 0:
         parameters.extend([bb_param, cc_param])
 
-    layer = CvxpyLayer(problem, parameters=parameters, variables=[U, P, V])
+    layer_variables = [U, P, V, S_obs, obj_value]
+    if S_pairs is not None:
+        layer_variables.append(S_pairs)
+
+    layer = CvxpyLayer(problem, parameters=parameters, variables=layer_variables)
 
     meta = {
         "num_states": num_states,
@@ -207,6 +233,12 @@ def build_mpc_cvxpy_layer(
         "num_obs": num_obs,
         "num_pairs": num_pairs,
         "obs_bits_shape": (num_obs, M, H, 4),
+        "slack_penalty": slack_penalty,
+        "output_order": (
+            ["U", "P", "V", "S_obs", "obj_value", "S_pairs"]
+            if num_pairs > 0
+            else ["U", "P", "V", "S_obs", "obj_value"]
+        ),
         "parameter_order": (
             ["p0", "v0", "goals", "obs_bits", "bb", "cc"]
             if num_pairs > 0
@@ -214,6 +246,8 @@ def build_mpc_cvxpy_layer(
         ),
     }
 
+    layer.meta = meta
+    layer.output_order = meta["output_order"]
     return layer, meta
 
 

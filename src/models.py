@@ -1,10 +1,6 @@
 
 import torch
 import torch.nn as nn
-import numpy as np
-import cvxpy as cp
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing as mp
 import wandb
 
 # Define some penalty functions that we may use
@@ -18,6 +14,55 @@ def combined_loss_fcn(loss_components, weights):
     assert len(loss_components) == len(weights), "Number of loss components must match number of weights."
     combined_loss = sum(w * lc for w, lc in zip(weights, loss_components))
     return combined_loss
+
+def extract_cvx_outputs(cvx_layer, outputs):
+    """
+    Normalise CVX layer outputs into a dictionary keyed by variable name.
+    Falls back to reasonable defaults when metadata is unavailable.
+    """
+    if isinstance(outputs, dict):
+        return outputs
+
+    if not isinstance(outputs, (tuple, list)):
+        outputs = (outputs,)
+
+    mapping = {}
+    output_order = None
+
+    if hasattr(cvx_layer, "meta"):
+        output_order = cvx_layer.meta.get("output_order")
+    if output_order is None and hasattr(cvx_layer, "output_order"):
+        output_order = getattr(cvx_layer, "output_order")
+
+    if output_order is not None and len(output_order) == len(outputs):
+        mapping.update(dict(zip(output_order, outputs)))
+    else:
+        default_orders = {
+            2: ["x_opt", "s_opt"],
+            4: ["U", "P", "V", "S_obs"],
+            5: ["U", "P", "V", "S_obs", "obj_value"],
+            6: ["U", "P", "V", "S_obs", "obj_value", "S_pairs"],
+        }
+        names = default_orders.get(len(outputs))
+        if names is not None:
+            mapping.update(dict(zip(names, outputs)))
+
+    # Ensure common aliases are populated
+    if "P" in mapping and "x_opt" not in mapping:
+        mapping["x_opt"] = mapping["P"]
+    if "S_obs" in mapping and "s_opt" not in mapping:
+        mapping["s_opt"] = mapping["S_obs"]
+    if "obj_value" not in mapping and len(outputs) >= 5:
+        mapping["obj_value"] = outputs[4]
+    if "S_obs" not in mapping and len(outputs) >= 4:
+        mapping["S_obs"] = outputs[3]
+        mapping.setdefault("s_opt", outputs[3])
+    if "x_opt" not in mapping and len(outputs) >= 1:
+        mapping["x_opt"] = outputs[0]
+    if "s_opt" not in mapping and len(outputs) >= 2:
+        mapping["s_opt"] = outputs[1]
+
+    return mapping
 
 class SSL_MIQP_incorporated:
 
@@ -115,7 +160,7 @@ class SSL_MIQP_incorporated:
 
                     # Check if need to update the learning rates
                     last_lr = optimizer.param_groups[0]['lr']
-                    scheduler.step(loss.item())
+                    scheduler.step(avg_val_loss)
                     current_lr = optimizer.param_groups[0]['lr']
                     if current_lr != last_lr:
                         print(f"Learning rate updated: {last_lr:.6f} -> {current_lr:.6f}")
@@ -131,8 +176,8 @@ class SSL_MIQP_incorporated:
                             return
         if wandb_log: wandb.finish()
                     
-    def train_SSL(self, ground_truth_solver, train_loader, test_loader, training_params, loss_weights, 
-            loss_scale = 1.0, obj_fcn = lambda: 0, y_cons = [], 
+    def train_SSL(self, ground_truth_solver, train_loader, test_loader, training_params, loss_weights,
+            loss_scale = 1.0, obj_fcn = None, y_cons = None,
             slack_penalty = l1_penalty, constraint_penalty = torch.relu, 
             wandb_log = False):
         """
@@ -160,6 +205,14 @@ class SSL_MIQP_incorporated:
         self.nn_model.to(device)
         self.cvx_layer.cvxpylayer.to(device)
 
+        if obj_fcn is None:
+            def obj_fcn(_, __, theta):
+                # default objective is zero; ensure correct device/dtype
+                return theta.new_zeros(theta.shape[0])
+
+        if y_cons is None:
+            y_cons = []
+
         # Define weights for loss components
         weights = torch.tensor(loss_weights, device=device)
         weights = loss_scale*weights / weights.sum() # may scale up the weights a bit
@@ -185,17 +238,27 @@ class SSL_MIQP_incorporated:
                 y_pred = self.nn_model(theta).float() # (B, ny), hard {0,1}
                 # ---- Solve convex subproblem given y ----
                 # CVXPYLayer supports autograd; keep inputs requiring grad if needed
-                x_opt, s_opt = self.cvx_layer.solve(theta, y_pred)
+                cvx_outputs = self.cvx_layer.solve(theta, y_pred)
+                cvx_dict = extract_cvx_outputs(self.cvx_layer, cvx_outputs)
+                # x_opt = cvx_dict.get("x_opt")
+                s_opt = cvx_dict.get("s_opt")
                 # May need it to include a supervised loss function 
                 x_solver, y_solver = ground_truth_solver(theta)
                 supervised_loss = supervised_loss_fn(y_pred, y_solver.float())
-                obj_val = obj_fcn(x_opt, y_pred, theta).mean()
+                obj_value_tensor = cvx_dict.get("obj_value")
+                if obj_value_tensor is None:
+                    raise ValueError("CVX layer output missing objective value required for loss computation.")
+                obj_val = obj_value_tensor.mean()
                 # Slack penalty, for constraint violation of the ones involving continuous decision variables
+                if s_opt is None:
+                    raise ValueError("CVX layer output missing slack variables required for penalty computation.")
                 slack_pen = slack_penalty(s_opt).mean()
                 # Violation penalty for constraint violation only on the integer decision variables
-                y_constraint = [f(y_pred, theta) for f in y_cons] # list of Mx1 tensors
-                y_constraint = torch.stack(y_constraint) # shape: (num_constraints, batch_size)
-                y_penalty = constraint_penalty(y_constraint).mean()
+                if y_cons:
+                    y_constraint = torch.stack([f(y_pred, theta) for f in y_cons]) # shape: (num_constraints, batch_size)
+                    y_penalty = constraint_penalty(y_constraint).mean()
+                else:
+                    y_penalty = theta.new_tensor(0.0)
                 # Total loss with balanced weights
                 loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
                 if wandb_log: wandb.log({
@@ -224,18 +287,28 @@ class SSL_MIQP_incorporated:
                             # ---- Predict y from theta ----
                             y_pred = self.nn_model(theta).float() # (B, ny), hard {0,1}
                             # ---- Solve convex subproblem given y ----
-                            x_opt, s_opt = self.cvx_layer.solve(theta, y_pred)
+                            cvx_outputs = self.cvx_layer.solve(theta, y_pred)
+                            cvx_dict = extract_cvx_outputs(self.cvx_layer, cvx_outputs)
+                            # x_opt = cvx_dict.get("x_opt")
+                            s_opt = cvx_dict.get("s_opt")
+                            obj_value_tensor = cvx_dict.get("obj_value")
                             # May need it to include a supervised loss function 
                             x_solver, y_solver = ground_truth_solver(theta)
                             supervised_loss = supervised_loss_fn(y_pred, y_solver.float())
-                            obj_val = obj_fcn(x_opt, y_pred, theta).mean()
+                            if obj_value_tensor is None:
+                                raise ValueError("CVX layer output missing objective value required for loss computation.")
+                            obj_val = obj_value_tensor.mean()
                             opt_obj_val = obj_fcn(x_solver, y_solver, theta).mean()
                             # Slack penalty, for constraint violation of the ones involving continuous decision variables
+                            if s_opt is None:
+                                raise ValueError("CVX layer output missing slack variables required for penalty computation.")
                             slack_pen = slack_penalty(s_opt).mean()
                             # Violation penalty for constraint violation only on the integer decision variables
-                            y_constraint = [f(y_pred, theta) for f in y_cons]
-                            y_constraint = torch.stack(y_constraint) # shape: (num_constraints, batch_size, ...)
-                            y_penalty = constraint_penalty(y_constraint).mean()
+                            if y_cons:
+                                y_constraint = torch.stack([f(y_pred, theta) for f in y_cons]) # shape: (num_constraints, batch_size, ...)
+                                y_penalty = constraint_penalty(y_constraint).mean()
+                            else:
+                                y_penalty = theta.new_tensor(0.0)
                             # Total loss with balanced weights
                             loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
 
@@ -248,14 +321,21 @@ class SSL_MIQP_incorporated:
                             supervised_loss_total.append(supervised_loss.item())
 
                         # Compute the averages
-                        avg_val_loss = torch.mean(torch.tensor(val_loss_total))
-                        avg_obj_val = torch.mean(torch.tensor(obj_val_total))
-                        opt_gap = 100*(torch.tensor(obj_val_total) - 
-                            torch.tensor(opt_obj_val_total))/torch.tensor(opt_obj_val_total).abs()
-                        avg_opt_gap = opt_gap.mean()
-                        avg_slack_pen = torch.mean(torch.tensor(slack_pen_total))
-                        avg_y_penalty = torch.mean(torch.tensor(y_penalty_total))
-                        avg_supervised_loss = torch.mean(torch.tensor(supervised_loss_total))
+                        val_loss_tensor = torch.tensor(val_loss_total)
+                        obj_val_tensor = torch.tensor(obj_val_total)
+                        opt_obj_val_tensor = torch.tensor(opt_obj_val_total)
+                        slack_pen_tensor = torch.tensor(slack_pen_total)
+                        y_penalty_tensor = torch.tensor(y_penalty_total)
+                        supervised_loss_tensor = torch.tensor(supervised_loss_total)
+
+                        avg_val_loss = val_loss_tensor.mean().item()
+                        avg_obj_val = obj_val_tensor.mean().item()
+                        denom = opt_obj_val_tensor.abs().clamp_min(1e-6)
+                        opt_gap = 100 * (obj_val_tensor - opt_obj_val_tensor) / denom
+                        avg_opt_gap = opt_gap.mean().item()
+                        avg_slack_pen = slack_pen_tensor.mean().item()
+                        avg_y_penalty = y_penalty_tensor.mean().item()
+                        avg_supervised_loss = supervised_loss_tensor.mean().item()
 
                     print(f"[epoch {epoch} | step {global_step}] "
                         f"validation: loss = {avg_val_loss:.4f}, "
@@ -275,7 +355,7 @@ class SSL_MIQP_incorporated:
 
                     # Check if need to update the learning rates
                     last_lr = optimizer.param_groups[0]['lr']
-                    scheduler.step(loss.item())
+                    scheduler.step(avg_val_loss)
                     current_lr = optimizer.param_groups[0]['lr']
                     if current_lr != last_lr:
                         print(f"Learning rate updated: {last_lr:.6f} -> {current_lr:.6f}")
@@ -395,7 +475,7 @@ class SSL_MIQP_corrected:
 
                     # Check if need to update the learning rates
                     last_lr = optimizer.param_groups[0]['lr']
-                    scheduler.step(loss.item())
+                    scheduler.step(avg_val_loss)
                     current_lr = optimizer.param_groups[0]['lr']
                     if current_lr != last_lr:
                         print(f"Learning rate updated: {last_lr:.6f} -> {current_lr:.6f}")
@@ -411,9 +491,9 @@ class SSL_MIQP_corrected:
                             return
         if wandb_log: wandb.finish()
 
-    def train_SSL(self, ground_truth_solver, train_loader, test_loader, training_params, loss_weights, 
-            loss_scale = 1.0, obj_fcn = lambda: 0, y_cons = [], 
-            slack_penalty = l1_penalty, constraint_penalty = torch.relu, 
+    def train_SSL(self, ground_truth_solver, train_loader, test_loader, training_params, loss_weights,
+            loss_scale = 1.0, obj_fcn = None, y_cons = None,
+            slack_penalty = l1_penalty, constraint_penalty = torch.relu,
             wandb_log = False):
         """
         Train the neural network model using self-supervised learning.
@@ -442,6 +522,13 @@ class SSL_MIQP_corrected:
         self.cvx_layer.cvxpylayer.to(device)
         self.sl_model.eval()
 
+        if obj_fcn is None:
+            def obj_fcn(_, __, theta):
+                return theta.new_zeros(theta.shape[0])
+
+        if y_cons is None:
+            y_cons = []
+
         # Define weights for loss components
         weights = torch.tensor(loss_weights, device=device)
         weights = loss_scale*weights / weights.sum() # may scale up the weights a bit
@@ -460,7 +547,7 @@ class SSL_MIQP_corrected:
 
         # Validation for the supervised learning model
         print("Validation for the supervised learning model: ")
-        val_loss_total = []; obj_val_total = []; opt_obj_val_total = [] 
+        val_loss_total = []; obj_val_total = []; opt_obj_val_total = []
         slack_pen_total = []; y_penalty_total = []; supervised_loss_total = []
         with torch.no_grad():
             for val_batch in test_loader:
@@ -469,18 +556,28 @@ class SSL_MIQP_corrected:
                 y_pred = self.sl_model(theta).float() # (B, ny), hard {0,1}
                 # ---- Solve convex subproblem given y ----
                 # CVXPYLayer supports autograd; keep inputs requiring grad if needed
-                x_opt, s_opt = self.cvx_layer.solve(theta, y_pred)
+                cvx_outputs = self.cvx_layer.solve(theta, y_pred)
+                cvx_dict = extract_cvx_outputs(self.cvx_layer, cvx_outputs)
+                # x_opt = cvx_dict.get("x_opt")
+                s_opt = cvx_dict.get("s_opt")
+                obj_value_tensor = cvx_dict.get("obj_value")
                 # May need it to include a supervised loss function 
                 x_solver, y_solver = ground_truth_solver(theta)
                 supervised_loss = supervised_loss_fn(y_pred, y_solver.float())
-                obj_val = obj_fcn(x_opt, y_pred, theta).mean()
+                if obj_value_tensor is None:
+                    raise ValueError("CVX layer output missing objective value required for loss computation.")
+                obj_val = obj_value_tensor.mean()
                 opt_obj_val = obj_fcn(x_solver, y_solver, theta).mean()
                 # Slack penalty, for constraint violation of the ones involving continuous decision variables
+                if s_opt is None:
+                    raise ValueError("CVX layer output missing slack variables required for penalty computation.")
                 slack_pen = slack_penalty(s_opt).mean()
                 # Violation penalty for constraint violation only on the integer decision variables
-                y_constraint = [f(y_pred, theta) for f in y_cons]
-                y_constraint = torch.stack(y_constraint) # shape: (num_constraints, batch_size, ...)
-                y_penalty = constraint_penalty(y_constraint).mean()
+                if y_cons:
+                    y_constraint = torch.stack([f(y_pred, theta) for f in y_cons]) # shape: (num_constraints, batch_size, ...)
+                    y_penalty = constraint_penalty(y_constraint).mean()
+                else:
+                    y_penalty = theta.new_tensor(0.0)
                 # Total loss with balanced weights
                 loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
 
@@ -492,22 +589,31 @@ class SSL_MIQP_corrected:
                 y_penalty_total.append(y_penalty.item())
                 supervised_loss_total.append(supervised_loss.item())
 
-            # Compute the averages
-            avg_obj_val = torch.mean(torch.tensor(obj_val_total))
-            opt_gap = 100*(torch.tensor(obj_val_total) - 
-                torch.tensor(opt_obj_val_total))/torch.tensor(opt_obj_val_total).abs()
-            avg_opt_gap = opt_gap.mean()
-            avg_slack_pen = torch.mean(torch.tensor(slack_pen_total))
-            avg_y_penalty = torch.mean(torch.tensor(y_penalty_total))
-            avg_supervised_loss = torch.mean(torch.tensor(supervised_loss_total))
+        # Compute the averages
+        val_loss_tensor = torch.tensor(val_loss_total)
+        obj_val_tensor = torch.tensor(obj_val_total)
+        opt_obj_val_tensor = torch.tensor(opt_obj_val_total)
+        slack_pen_tensor = torch.tensor(slack_pen_total)
+        y_penalty_tensor = torch.tensor(y_penalty_total)
+        supervised_loss_tensor = torch.tensor(supervised_loss_total)
 
-            print(
-                f"obj_val = {avg_obj_val:.4f}, "
-                f"opt_gap = {avg_opt_gap:.4f} %, "
-                f"slack_pen = {avg_slack_pen:.4f}, "
-                f"y_penalty = {avg_y_penalty:.4f}, "
-                f"supervised_loss = {avg_supervised_loss:.4f}, ")
-            print("_"*50)                 
+        avg_val_loss = val_loss_tensor.mean().item()
+        avg_obj_val = obj_val_tensor.mean().item()
+        denom = opt_obj_val_tensor.abs().clamp_min(1e-6)
+        opt_gap = 100 * (obj_val_tensor - opt_obj_val_tensor) / denom
+        avg_opt_gap = opt_gap.mean().item()
+        avg_slack_pen = slack_pen_tensor.mean().item()
+        avg_y_penalty = y_penalty_tensor.mean().item()
+        avg_supervised_loss = supervised_loss_tensor.mean().item()
+
+        print(
+            f"val_loss = {avg_val_loss:.4f}, "
+            f"obj_val = {avg_obj_val:.4f}, "
+            f"opt_gap = {avg_opt_gap:.4f} %, "
+            f"slack_pen = {avg_slack_pen:.4f}, "
+            f"y_penalty = {avg_y_penalty:.4f}, "
+            f"supervised_loss = {avg_supervised_loss:.4f}, ")
+        print("_"*50)                 
                
         for epoch in range(1, TRAINING_EPOCHS+1):
             self.nn_model.train()
@@ -521,20 +627,30 @@ class SSL_MIQP_corrected:
                 y_pred = self.nn_model(concat_input).float() # (B, ny), hard {0,1}
                 # ---- Solve convex subproblem given y ----
                 # CVXPYLayer supports autograd; keep inputs requiring grad if needed
-                x_opt, s_opt = self.cvx_layer.solve(theta, y_pred)
+                cvx_outputs = self.cvx_layer.solve(theta, y_pred)
+                cvx_dict = extract_cvx_outputs(self.cvx_layer, cvx_outputs)
+                # x_opt = cvx_dict.get("x_opt")
+                s_opt = cvx_dict.get("s_opt")
+                obj_value_tensor = cvx_dict.get("obj_value")
                 # May need it to include a supervised loss function 
                 x_solver, y_solver = ground_truth_solver(theta)
                 # supervised learning loss for deviation from SL model prediction
-                deviation_loss = supervised_loss_fn(y_pred, y_pred_hat.float())
-                obj_val = obj_fcn(x_opt, y_pred, theta).mean()
+                supervised_loss = supervised_loss_fn(y_pred, y_pred_hat.float())
+                if obj_value_tensor is None:
+                    raise ValueError("CVX layer output missing objective value required for loss computation.")
+                obj_val = obj_value_tensor.mean()
                 # Slack penalty, for constraint violation of the ones involving continuous decision variables
+                if s_opt is None:
+                    raise ValueError("CVX layer output missing slack variables required for penalty computation.")
                 slack_pen = slack_penalty(s_opt).mean()
                 # Violation penalty for constraint violation only on the integer decision variables
-                y_constraint = [f(y_pred, theta) for f in y_cons] # list of Mx1 tensors
-                y_constraint = torch.stack(y_constraint) # shape: (num_constraints, batch_size)
-                y_penalty = constraint_penalty(y_constraint).mean()
+                if y_cons:
+                    y_constraint = torch.stack([f(y_pred, theta) for f in y_cons]) # shape: (num_constraints, batch_size)
+                    y_penalty = constraint_penalty(y_constraint).mean()
+                else:
+                    y_penalty = theta.new_tensor(0.0)
                 # Total loss with balanced weights
-                loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, deviation_loss], weights)
+                loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
                 if wandb_log: wandb.log({
                     "train/combined_loss": loss.item(),
                     "train/obj_val": obj_val.item(),
@@ -564,18 +680,28 @@ class SSL_MIQP_corrected:
                             concat_input = torch.cat([theta, y_pred_hat], dim=-1)
                             y_pred = self.nn_model(concat_input).float() # (B, ny), hard {0,1}
                             # ---- Solve convex subproblem given y ----
-                            x_opt, s_opt = self.cvx_layer.solve(theta, y_pred)
+                            cvx_outputs = self.cvx_layer.solve(theta, y_pred)
+                            cvx_dict = extract_cvx_outputs(self.cvx_layer, cvx_outputs)
+                            # x_opt = cvx_dict.get("x_opt")
+                            s_opt = cvx_dict.get("s_opt")
+                            obj_value_tensor = cvx_dict.get("obj_value")
                             # May need it to include a supervised loss function 
                             x_solver, y_solver = ground_truth_solver(theta)
                             supervised_loss = supervised_loss_fn(y_pred, y_solver.float())
-                            obj_val = obj_fcn(x_opt, y_pred, theta).mean()
+                            if obj_value_tensor is None:
+                                raise ValueError("CVX layer output missing objective value required for loss computation.")
+                            obj_val = obj_value_tensor.mean()
                             opt_obj_val = obj_fcn(x_solver, y_solver, theta).mean()
                             # Slack penalty, for constraint violation of the ones involving continuous decision variables
+                            if s_opt is None:
+                                raise ValueError("CVX layer output missing slack variables required for penalty computation.")
                             slack_pen = slack_penalty(s_opt).mean()
                             # Violation penalty for constraint violation only on the integer decision variables
-                            y_constraint = [f(y_pred, theta) for f in y_cons]
-                            y_constraint = torch.stack(y_constraint) # shape: (num_constraints, batch_size, ...)
-                            y_penalty = constraint_penalty(y_constraint).mean()
+                            if y_cons:
+                                y_constraint = torch.stack([f(y_pred, theta) for f in y_cons]) # shape: (num_constraints, batch_size, ...)
+                                y_penalty = constraint_penalty(y_constraint).mean()
+                            else:
+                                y_penalty = theta.new_tensor(0.0)
                             # Total loss with balanced weights
                             loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
 
@@ -587,15 +713,21 @@ class SSL_MIQP_corrected:
                             y_penalty_total.append(y_penalty.item())
                             supervised_loss_total.append(supervised_loss.item())
 
-                        # Compute the averages
-                        avg_val_loss = torch.mean(torch.tensor(val_loss_total))
-                        avg_obj_val = torch.mean(torch.tensor(obj_val_total))
-                        opt_gap = 100*(torch.tensor(obj_val_total) - 
-                            torch.tensor(opt_obj_val_total))/torch.tensor(opt_obj_val_total).abs()
-                        avg_opt_gap = opt_gap.mean()
-                        avg_slack_pen = torch.mean(torch.tensor(slack_pen_total))
-                        avg_y_penalty = torch.mean(torch.tensor(y_penalty_total))
-                        avg_supervised_loss = torch.mean(torch.tensor(supervised_loss_total))
+                        val_loss_tensor = torch.tensor(val_loss_total)
+                        obj_val_tensor = torch.tensor(obj_val_total)
+                        opt_obj_val_tensor = torch.tensor(opt_obj_val_total)
+                        slack_pen_tensor = torch.tensor(slack_pen_total)
+                        y_penalty_tensor = torch.tensor(y_penalty_total)
+                        supervised_loss_tensor = torch.tensor(supervised_loss_total)
+
+                        avg_val_loss = val_loss_tensor.mean().item()
+                        avg_obj_val = obj_val_tensor.mean().item()
+                        denom = opt_obj_val_tensor.abs().clamp_min(1e-6)
+                        opt_gap = 100 * (obj_val_tensor - opt_obj_val_tensor) / denom
+                        avg_opt_gap = opt_gap.mean().item()
+                        avg_slack_pen = slack_pen_tensor.mean().item()
+                        avg_y_penalty = y_penalty_tensor.mean().item()
+                        avg_supervised_loss = supervised_loss_tensor.mean().item()
 
                     print(f"[epoch {epoch} | step {global_step}] "
                         f"validation: loss = {avg_val_loss:.4f}, "
@@ -615,7 +747,7 @@ class SSL_MIQP_corrected:
 
                     # Check if need to update the learning rates
                     last_lr = optimizer.param_groups[0]['lr']
-                    scheduler.step(loss.item())
+                    scheduler.step(avg_val_loss)
                     current_lr = optimizer.param_groups[0]['lr']
                     if current_lr != last_lr:
                         print(f"Learning rate updated: {last_lr:.6f} -> {current_lr:.6f}")
