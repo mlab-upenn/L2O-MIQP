@@ -99,6 +99,9 @@ def build_mpc_cvxpy_layer(
     unique_pairs = [(min(i, j), max(i, j)) for i, j in coupling_pairs if i < j]
     num_pairs = len(unique_pairs)
 
+    eps_ridge = 1e-6     # try 1e-6 .. 1e-4
+    eps_slack = 1e-8     # strict interior
+
     # Decision variables.
     P = cp.Variable((num_states, horizon_vars))
     V = cp.Variable((num_states, horizon_vars))
@@ -178,6 +181,9 @@ def build_mpc_cvxpy_layer(
                 >= W0[obs_idx] - big_m * obs_binary_param[obs_idx, m, :, 3],
             ]
 
+    # constraints += [S_obs >= eps_slack]
+    # constraints += [S_obs <= 0.1]
+
     # Inter-robot collision avoidance constraints.
     if num_pairs > 0:
         for pair_idx, (m, n) in enumerate(unique_pairs):
@@ -205,27 +211,38 @@ def build_mpc_cvxpy_layer(
     if S_pairs is not None:
         slack_cost += slack_penalty * cp.sum(S_pairs)
 
-    objective_expr = (
+    objective = cp.Minimize(
         Wu * cp.sum_squares(U)
         + Wp * cp.sum_squares(P[:, :H] - goal_column)
         + Wpt * cp.sum_squares(P[:, -1] - goals)
         + slack_cost
-    )
-    obj_value = cp.Variable()
-    constraints.append(objective_expr <= obj_value)
-    objective = cp.Minimize(obj_value)
-
+        # --- ridge for strong convexity ---
+        # + eps_ridge * (cp.sum_squares(U) + cp.sum_squares(P) + cp.sum_squares(V))
+        )
     problem = cp.Problem(objective, constraints)
 
     parameters = [p0, v0, goals, obs_binary_param]
     if num_pairs > 0:
         parameters.extend([bb_param, cc_param])
 
-    layer_variables = [U, P, V, S_obs, obj_value]
+    layer_variables = [U, P, V, S_obs]
     if S_pairs is not None:
         layer_variables.append(S_pairs)
 
-    layer = CvxpyLayer(problem, parameters=parameters, variables=layer_variables)
+    # solver_args_osqp = dict(
+    #     solver=cp.OSQP,
+    #     eps_abs=1e-3, eps_rel=1e-3,
+    #     max_iter=4000,
+    #     polish=False,
+    #     verbose=False,
+    #     adaptive_rho=True,
+    # )
+
+    layer = CvxpyLayer(problem, 
+                       parameters=parameters, 
+                       variables=layer_variables,
+                    #    solver_args=solver_args_osqp
+                       )
 
     meta = {
         "num_states": num_states,
