@@ -141,14 +141,14 @@ class SSL_MIQP_incorporated:
                         print(f"Learning rate updated: {last_lr:.6f} -> {current_lr:.6f}")
                         last_lr = current_lr
 
-                    if avg_val_loss < best_val_loss:
-                        best_val_loss = avg_val_loss
-                        epochs_no_improve = 0
-                    else:
-                        epochs_no_improve += 1
-                        if epochs_no_improve >= PATIENCE:
-                            print("Early stopping triggered!")
-                            return
+                    # if avg_val_loss < best_val_loss:
+                    #     best_val_loss = avg_val_loss
+                    #     epochs_no_improve = 0
+                    # else:
+                    #     epochs_no_improve += 1
+                    #     if epochs_no_improve >= PATIENCE:
+                    #         print("Early stopping triggered!")
+                    #         return
         if wandb_log: wandb.finish()
                     
     def train_SSL(self, train_loader, test_loader, training_params, loss_weights, 
@@ -216,7 +216,8 @@ class SSL_MIQP_incorporated:
                 y_penalty = constraint_violation_torch(y_transposed, p_opt[:, :2, :]).mean()
                 
                 # Total loss with balanced weights
-                loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
+                loss = supervised_loss
+                # loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
                 if wandb_log: wandb.log({
                     "train/combined_loss": loss.item(),
                     "train/obj_val": obj_val.item(),
@@ -246,35 +247,37 @@ class SSL_MIQP_incorporated:
                     slack_pen_total = []; y_penalty_total = []
                     supervised_loss_total = []
 
-                    with torch.no_grad():
-                        for theta, y_gt, pv_gt, u_gt in test_loader:
-                            theta = theta.to(device)
-                            y_gt = y_gt.to(device)
-                            pv_gt = pv_gt.to(device)
-                            u_gt = u_gt.to(device)
-
-                            # ---- Predict y from theta ----
-                            y_pred, u_opt, p_opt, s_opt, obj_val = self.forward(theta)    
-
-                            supervised_loss = supervised_loss_fn(y_pred, y_gt.float())
-
-                            # Slack penalty included inside cvx_layer.solve
-                            slack_pen = s_opt.sum(dim=1).mean()
-                            y_transposed = NNoutput_reshape_torch(y_pred, N_obs=3) # (B, 3, 4, H)
-                            y_penalty = constraint_violation_torch(y_transposed, p_opt[:, :2, :]).mean()
                 
-                            # Total loss with balanced weights
-                            loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
+                    with torch.no_grad():
+                        # for theta, y_gt, pv_gt, u_gt in test_loader:
+                        theta, y_gt, pv_gt, u_gt = next(iter(test_loader))                     
+                        theta = theta.to(device)
+                        y_gt = y_gt.to(device)
+                        pv_gt = pv_gt.to(device)
+                        u_gt = u_gt.to(device)
 
-                            opt_obj_val = _obj_function(u_gt, pv_gt[:, :2, :], theta, meta=None).mean()
+                        # ---- Predict y from theta ----
+                        y_pred, u_opt, p_opt, s_opt, obj_val = self.forward(theta)    
 
-                            # Collect loss values
-                            val_loss_total.append(loss.item())       
-                            obj_val_total.append(obj_val.item())
-                            opt_obj_val_total.append(opt_obj_val.item())
-                            slack_pen_total.append(slack_pen.item())
-                            y_penalty_total.append(y_penalty.item())
-                            supervised_loss_total.append(supervised_loss.item())
+                        supervised_loss = supervised_loss_fn(y_pred, y_gt.float())
+
+                        # Slack penalty included inside cvx_layer.solve
+                        slack_pen = s_opt.sum(dim=1).mean()
+                        y_transposed = NNoutput_reshape_torch(y_pred, N_obs=3) # (B, 3, 4, H)
+                        y_penalty = constraint_violation_torch(y_transposed, p_opt[:, :2, :]).mean()
+            
+                        # Total loss with balanced weights
+                        loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
+
+                        opt_obj_val = _obj_function(u_gt, pv_gt[:, :2, :], theta, meta=None).mean()
+
+                        # Collect loss values
+                        val_loss_total.append(loss.item())       
+                        obj_val_total.append(obj_val.item())
+                        opt_obj_val_total.append(opt_obj_val.item())
+                        slack_pen_total.append(slack_pen.item())
+                        y_penalty_total.append(y_penalty.item())
+                        supervised_loss_total.append(supervised_loss.item())
 
                         # Compute the averages
                         avg_val_loss = torch.mean(torch.tensor(val_loss_total))
@@ -341,9 +344,8 @@ class SSL_MIQP_incorporated:
         self.nn_model.eval()
         supervised_loss_fn = nn.HuberLoss() 
         
-        y_mismatch_gt = []
-        constraint_violation = []
-        optimality_gap = []
+        obj_val_total = []; opt_obj_val_total = []
+        slack_pen_total = []; y_penalty_total = []; supervised_loss_total = []
 
         with torch.no_grad():
             for theta, y_gt, pv_gt, u_gt in data_loader:
@@ -356,31 +358,44 @@ class SSL_MIQP_incorporated:
                 y_pred, u_opt, p_opt, s_opt, obj_val = self.forward(theta)
 
                 supervised_loss = supervised_loss_fn(y_pred, y_gt.float())
-                y_mismatch_gt.append(supervised_loss.item())
-
-                y_pred_shaped = NNoutput_reshape_torch(y_pred, N_obs=3) # (B, 3, 4, H)
-                y_penalty = constraint_violation_torch(y_pred_shaped, p_opt[:, :2, :]).mean()
-                constraint_violation.append(y_penalty.item())
+                slack_pen = s_opt.sum(dim=1).mean()
+                y_transposed = NNoutput_reshape_torch(y_pred, N_obs=3) # (B, 3, 4, H)
+                y_penalty = constraint_violation_torch(y_transposed, p_opt[:, :2, :]).mean()
+                
+                # Total loss with balanced weights
+                # loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
 
                 opt_obj_val = _obj_function(u_gt, pv_gt[:, :2, :], theta, meta=None).mean()
-                # opt_gap = 100*(obj_val - opt_obj_val)/opt_obj_val.abs()
-                opt_gap = obj_val - opt_obj_val
-                optimality_gap.append(opt_gap.item())
 
-        avg_supervised_loss = sum(y_mismatch_gt) / len(y_mismatch_gt) if y_mismatch_gt else 0
-        avg_constraint_violation = sum(constraint_violation) / len(constraint_violation) if constraint_violation else 0
-        avg_optimality_gap = sum(optimality_gap) / len(optimality_gap) if optimality_gap else 0
+                # Collect loss values
+                # val_loss_total.append(loss.item())       
+                obj_val_total.append(obj_val.item())
+                opt_obj_val_total.append(opt_obj_val.item())
+                slack_pen_total.append(slack_pen.item())
+                y_penalty_total.append(y_penalty.item())
+                supervised_loss_total.append(supervised_loss.item())
+
+        # Compute the averages
+        # avg_val_loss = torch.mean(torch.tensor(val_loss_total))
+        avg_obj_val = torch.mean(torch.tensor(obj_val_total))
+        opt_gap = 100*(torch.tensor(obj_val_total) - 
+                            torch.tensor(opt_obj_val_total))/torch.tensor(opt_obj_val_total).abs()
+        avg_opt_gap = opt_gap.mean()
+        avg_slack_pen = torch.mean(torch.tensor(slack_pen_total))
+        avg_y_penalty = torch.mean(torch.tensor(y_penalty_total))
+        avg_supervised_loss = torch.mean(torch.tensor(supervised_loss_total))
 
         results = {
-            "avg_supervised_loss": avg_supervised_loss,
-            "avg_constraint_violation": avg_constraint_violation,
-            "avg_optimality_gap": avg_optimality_gap
+            "avg_obj_val": avg_obj_val.item(),
+            "avg_optimality_gap": avg_opt_gap.item(),
+            "avg_slack_penalty": avg_slack_pen.item(),
+            "avg_y_penalty": avg_y_penalty.item(),
+            "avg_supervised_loss": avg_supervised_loss.item()
         }
 
-        print(f"Evaluation Results: "
-              f"Avg Supervised Loss = {avg_supervised_loss:.4f}, "
-              f"Avg Constraint Violation = {avg_constraint_violation:.4f}, "
-              f"Avg Optimality Gap = {avg_optimality_gap:.4f}")
+        print("Evaluation Results:")
+        for key, value in results.items():
+            print(f"{key}: {value:.4f}")
 
         return results
 
