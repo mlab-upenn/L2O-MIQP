@@ -252,9 +252,9 @@ def build_mpc_cvxpy_layer(
         "obs_bits_shape": (num_obs, M, H, 4),
         "slack_penalty": slack_penalty,
         "output_order": (
-            ["U", "P", "V", "S_obs", "obj_value", "S_pairs"]
+            ["U", "P", "V", "S_obs", "S_pairs"]
             if num_pairs > 0
-            else ["U", "P", "V", "S_obs", "obj_value"]
+            else ["U", "P", "V", "S_obs"]
         ),
         "parameter_order": (
             ["p0", "v0", "goals", "obs_bits", "bb", "cc"]

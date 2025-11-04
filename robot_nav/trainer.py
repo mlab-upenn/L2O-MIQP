@@ -19,6 +19,25 @@ def combined_loss_fcn(loss_components, weights):
     combined_loss = sum(w * lc for w, lc in zip(weights, loss_components))
     return combined_loss
 
+def _obj_function(u_opt, p_opt, x, meta):
+    """
+    Example objective function computation.
+    Args:
+        u_opt: Optimal control inputs (B, nu, H)
+        p_opt: Optimal positions (B, 2, H)
+        x: Initial states (B, nx)
+        meta: Dictionary containing objective parameters
+    Returns:
+        Objective value tensor.
+    """
+    Wu, Wp, Wpt = 1.0, 1.0, 10.0
+    objective_value = (
+        Wu * torch.sum(u_opt ** 2) +
+        Wp * torch.sum((p_opt[:, :, :-1] - x[:, 2:4].unsqueeze(-1).expand(-1, -1, 20)) ** 2) +
+        Wpt * torch.sum((p_opt[:, :, -1] - x[:, 2:4]) ** 2)
+    )
+    return objective_value
+
 class SSL_MIQP_incorporated:
 
     def __init__(self, nn_model, cvx_layer, nx, ny, device=None):
@@ -171,11 +190,14 @@ class SSL_MIQP_incorporated:
         best_val_loss = float("inf") # Store best validation 
         epochs_no_improve = 0  # Count epochs with no improvement 
 
-        if wandb_log: wandb.init(
-            project=training_params.get("WANDB_PROJECT", "self_supervised_learning"),
-            name=training_params.get("RUN_NAME", None),
-            config=training_params
-        )     
+        started_wandb_run = False
+        if wandb_log and wandb.run is None:
+            wandb.init(
+                project=training_params.get("WANDB_PROJECT", "self_supervised_learning"),
+                name=training_params.get("RUN_NAME", None),
+                config=training_params
+            )
+            started_wandb_run = True     
     
         torch.autograd.set_detect_anomaly(True)
         for epoch in range(1, TRAINING_EPOCHS+1):
@@ -183,40 +205,15 @@ class SSL_MIQP_incorporated:
             for theta, y_gt, _, _ in train_loader:
                 theta = theta.to(device)
                 y_gt = y_gt.to(device)
-                # pv_gt_batch = pv_gt_batch.to(device)
-                # u_gt_batch = u_gt_batch.to(device)
-
-                B = theta.shape[0] # batch size
-                # ---- Predict y from theta ----
-                y_pred = self.nn_model(theta).float() # (B, ny), hard {0,1}
-
-                # ---- Solve convex subproblem given y ----
-                # CVXPYLayer supports autograd; keep inputs requiring grad if needed
-                theta_cpu   = theta.double().cpu()
-                y_pred_cpu = y_pred.double().cpu()
-                # print(self.cvx_layer.device)
-                _, p_opt, _, s_opt = self.cvx_layer(theta_cpu[:, 0:2], 
-                                                         theta_cpu[:, 2:4], 
-                                                         theta_cpu[:, 4:6], 
-                                                         y_pred_cpu.reshape(-1, 3, 1, 20, 4))
                 
-                p_opt = p_opt.to(device)
-                # obj_val = obj_val.to(device)
-                
+                # warped forward pass
+                y_pred, u_opt, p_opt, s_opt, obj_val = self.forward(theta)
+
                 # Supervised loss from dataset
                 supervised_loss = supervised_loss_fn(y_pred, y_gt.float())
-                # Objective value
-                # obj_val = obj_val.mean()
-                obj_val = torch.tensor(0.0, device=device) # skip, later store in dataset
-                # Slack penalty included inside cvx_layer.solve
-                slack_pen = s_opt.mean()
-                # Violation penalty for constraint violation only on the integer decision variables
-                # y_constraint = [f(y_pred, theta) for f in y_cons] # list of Mx1 tensors
-                # y_constraint = torch.stack(y_constraint) # shape: (num_constraints, batch_size)
-                # y_penalty = constraint_penalty(y_constraint).mean()
+                slack_pen = s_opt.sum(dim=1).mean()
                 y_transposed = NNoutput_reshape_torch(y_pred, N_obs=3) # (B, 3, 4, H)
-                cont_traj = p_opt[:, :2, :] # (B, 2, H)
-                y_penalty = constraint_violation_torch(y_transposed, cont_traj).mean()
+                y_penalty = constraint_violation_torch(y_transposed, p_opt[:, :2, :]).mean()
                 
                 # Total loss with balanced weights
                 loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
@@ -228,9 +225,12 @@ class SSL_MIQP_incorporated:
                     "train/supervised_loss": supervised_loss.item(),
                     "step": global_step})
                 
-                print(f"[epoch {epoch} | step {global_step}] loss: {loss.item():.4f}")
-                print(f"    obj_val: {obj_val.item():.4f}, slack_pen: {slack_pen.item():.4f}, "
-                      f"y_penalty: {y_penalty.item():.4f}, supervised_loss: {supervised_loss.item():.4f}")
+                # print(f"[epoch {epoch} | step {global_step}] "
+                #     f"train: loss = {loss.item():.4f}, "
+                #     f"obj_val = {obj_val.item():.4f}, "
+                #     f"slack_pen = {slack_pen.item():.4f}, "
+                #     f"y_penalty = {y_penalty.item():.4f}, "
+                #     f"supervised_loss = {supervised_loss.item():.4f}")
 
                 # ---- Backprop ----
                 optimizer.zero_grad()
@@ -240,52 +240,33 @@ class SSL_MIQP_incorporated:
                 global_step += 1
 
                 # ---- Logging ----
-                if (global_step % CHECKPOINT_AFTER) == 0:
-                    print("Starting validation...")
+                if global_step == 1 or (global_step % CHECKPOINT_AFTER) == 0:
                     self.nn_model.eval()
                     val_loss_total = []; obj_val_total = []; opt_obj_val_total = []
                     slack_pen_total = []; y_penalty_total = []
                     supervised_loss_total = []
+
                     with torch.no_grad():
-                        for theta_batch, y_gt_batch, _, _ in test_loader:
-                        # val_data = list(test_loader)
-                        # theta_batch, y_gt_batch, _, _ = random.choice(val_data)
-                        # for i in range(1):
-                            theta = theta_batch.to(device)
-                            y_gt_batch = y_gt_batch.to(device)
-                            # pv_gt_batch = pv_gt_batch.to(device)
-                            # u_gt_batch = u_gt_batch.to(device)
+                        for theta, y_gt, pv_gt, u_gt in test_loader:
+                            theta = theta.to(device)
+                            y_gt = y_gt.to(device)
+                            pv_gt = pv_gt.to(device)
+                            u_gt = u_gt.to(device)
 
                             # ---- Predict y from theta ----
-                            y_pred = self.nn_model(theta).float() # (B, ny), hard {0,1}
-                            # ---- Solve convex subproblem given y ----
-                            # CVXPYLayer supports autograd; keep inputs requiring grad if needed
-                            theta_cpu   = theta.double().cpu()
-                            y_pred_cpu = y_pred.double().cpu()
-                            _, p_opt, _, _ = self.cvx_layer(theta_cpu[:, 0:2], 
-                                                                    theta_cpu[:, 2:4], 
-                                                                    theta_cpu[:, 4:6], 
-                                                                    y_pred_cpu.reshape(-1, 3, 1, 20, 4))
-                            p_opt = p_opt.to(device)
-                            # Supervised loss from dataset
-                            supervised_loss = supervised_loss_fn(y_pred, y_gt_batch.float())
-                            # Objective value
-                            # obj_val = obj_val.mean()
-                            obj_val = torch.tensor(0.0, device=device) # skip, later store in dataset
+                            y_pred, u_opt, p_opt, s_opt, obj_val = self.forward(theta)    
+
+                            supervised_loss = supervised_loss_fn(y_pred, y_gt.float())
+
                             # Slack penalty included inside cvx_layer.solve
-                            slack_pen = torch.tensor(0.0, device=device)
-                            # Violation penalty for constraint violation only on the integer decision variables
-                            # y_constraint = [f(y_pred, theta) for f in y_cons] # list of Mx1 tensors
-                            # y_constraint = torch.stack(y_constraint) # shape: (num_constraints, batch_size)
-                            # y_penalty = constraint_penalty(y_constraint).mean()
+                            slack_pen = s_opt.sum(dim=1).mean()
                             y_transposed = NNoutput_reshape_torch(y_pred, N_obs=3) # (B, 3, 4, H)
-                            cont_traj = p_opt[:, :2, :] # (B, 2, H)
-                            y_penalty = constraint_violation_torch(y_transposed, cont_traj).mean()
+                            y_penalty = constraint_violation_torch(y_transposed, p_opt[:, :2, :]).mean()
                 
                             # Total loss with balanced weights
                             loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
 
-                            opt_obj_val = torch.tensor(0.0, device=device) # skip, later store in dataset
+                            opt_obj_val = _obj_function(u_gt, pv_gt[:, :2, :], theta, meta=None).mean()
 
                             # Collect loss values
                             val_loss_total.append(loss.item())       
@@ -314,6 +295,7 @@ class SSL_MIQP_incorporated:
                         f"supervised_loss = {avg_supervised_loss:.4f}, ")
                     # --- Log losses to wandb ---
                     if wandb_log: wandb.log({
+                        # "val/loss": avg_val_loss,
                         "val/avg_loss": avg_val_loss,
                         "val/obj_val": avg_obj_val,
                         "val/slack_pen": avg_slack_pen,
@@ -342,7 +324,100 @@ class SSL_MIQP_incorporated:
                     #     print("Slack penalty below threshold, stopping training.")
                     #     return
 
-        if wandb_log: wandb.finish()                        
+        if wandb_log and started_wandb_run: 
+            wandb.finish()          
+
+    def evaluate(self, data_loader, ground_truth_solver = None):
+        """
+        Evaluate the neural network model on given data.
+        Args:
+            data_loader: DataLoader for evaluation data.
+            ground_truth_solver: Function to get ground truth solutions. (probably not needed here)
+        Returns:
+            Dictionary containing evaluation metrics.
+        """
+        device = self.device
+        self.nn_model.to(device)
+        self.nn_model.eval()
+        supervised_loss_fn = nn.HuberLoss() 
+        
+        y_mismatch_gt = []
+        constraint_violation = []
+        optimality_gap = []
+
+        with torch.no_grad():
+            for theta, y_gt, pv_gt, u_gt in data_loader:
+                theta = theta.to(device)
+                y_gt = y_gt.to(device)
+                pv_gt = pv_gt.to(device)
+                u_gt = u_gt.to(device)
+                B = theta.shape[0]
+
+                y_pred, u_opt, p_opt, s_opt, obj_val = self.forward(theta)
+
+                supervised_loss = supervised_loss_fn(y_pred, y_gt.float())
+                y_mismatch_gt.append(supervised_loss.item())
+
+                y_pred_shaped = NNoutput_reshape_torch(y_pred, N_obs=3) # (B, 3, 4, H)
+                y_penalty = constraint_violation_torch(y_pred_shaped, p_opt[:, :2, :]).mean()
+                constraint_violation.append(y_penalty.item())
+
+                opt_obj_val = _obj_function(u_gt, pv_gt[:, :2, :], theta, meta=None).mean()
+                # opt_gap = 100*(obj_val - opt_obj_val)/opt_obj_val.abs()
+                opt_gap = obj_val - opt_obj_val
+                optimality_gap.append(opt_gap.item())
+
+        avg_supervised_loss = sum(y_mismatch_gt) / len(y_mismatch_gt) if y_mismatch_gt else 0
+        avg_constraint_violation = sum(constraint_violation) / len(constraint_violation) if constraint_violation else 0
+        avg_optimality_gap = sum(optimality_gap) / len(optimality_gap) if optimality_gap else 0
+
+        results = {
+            "avg_supervised_loss": avg_supervised_loss,
+            "avg_constraint_violation": avg_constraint_violation,
+            "avg_optimality_gap": avg_optimality_gap
+        }
+
+        print(f"Evaluation Results: "
+              f"Avg Supervised Loss = {avg_supervised_loss:.4f}, "
+              f"Avg Constraint Violation = {avg_constraint_violation:.4f}, "
+              f"Avg Optimality Gap = {avg_optimality_gap:.4f}")
+
+        return results
+
+    def forward(self, theta):
+        """
+        Forward pass through the neural network model and CVXPY layer.
+        Args:
+            theta: Input tensor of problem parameters.
+        Returns:
+            y_pred: Predicted integer variables from the neural network.
+            p_opt: Optimal positions from the CVXPY layer.
+            u_opt: Optimal control inputs from the CVXPY layer.
+            s_opt: Slack variables from the CVXPY layer.
+            obj_val: Objective value computed using the optimal solutions.
+        """
+        device = self.device
+
+        theta = theta.to(device)
+        y_pred = self.nn_model(theta).float()
+
+        theta = theta.cpu()
+        y_pred = y_pred.cpu()
+
+        u_opt, p_opt, _, s_opt = self.cvx_layer( theta[:, 0:2], 
+                                             theta[:, 2:4], 
+                                             theta[:, 4:6], 
+                                             y_pred.reshape(-1, 3, 1, 20, 4))
+
+        theta = theta.to(device)
+        y_pred = y_pred.to(device)
+        u_opt = u_opt.to(device)
+        p_opt = p_opt.to(device)
+
+        obj_val = _obj_function(u_opt, p_opt, theta.to(device), meta=None).mean()
+        obj_val += 1e4 * s_opt.sum(dim=1).mean()  # include slack penalty here
+
+        return y_pred, u_opt, p_opt, s_opt, obj_val
 
 
 class SSL_MIQP_corrected:
