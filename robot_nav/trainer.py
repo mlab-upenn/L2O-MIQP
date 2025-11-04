@@ -216,8 +216,8 @@ class SSL_MIQP_incorporated:
                 y_penalty = constraint_violation_torch(y_transposed, p_opt[:, :2, :]).mean()
                 
                 # Total loss with balanced weights
-                loss = supervised_loss
-                # loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
+                # loss = supervised_loss
+                loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
                 if wandb_log: wandb.log({
                     "train/combined_loss": loss.item(),
                     "train/obj_val": obj_val.item(),
