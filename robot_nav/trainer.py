@@ -1,4 +1,5 @@
 
+import os
 import torch
 import torch.nn as nn
 import numpy as np
@@ -28,14 +29,17 @@ def _obj_function(u_opt, p_opt, x, meta):
         x: Initial states (B, nx)
         meta: Dictionary containing objective parameters
     Returns:
-        Objective value tensor.
+        Objective value tensor of shape (B,).
     """
     Wu, Wp, Wpt = 1.0, 1.0, 10.0
-    objective_value = (
-        Wu * torch.sum(u_opt ** 2) +
-        Wp * torch.sum((p_opt[:, :, :-1] - x[:, 2:4].unsqueeze(-1).expand(-1, -1, 20)) ** 2) +
-        Wpt * torch.sum((p_opt[:, :, -1] - x[:, 2:4]) ** 2)
-    )
+
+    u_cost = torch.sum(u_opt ** 2, dim=(1, 2))
+    target_pos = x[:, 2:4]
+    tracking_target = target_pos.unsqueeze(-1).expand_as(p_opt[:, :, :-1])
+    tracking_cost = torch.sum((p_opt[:, :, :-1] - tracking_target) ** 2, dim=(1, 2))
+    terminal_cost = torch.sum((p_opt[:, :, -1] - target_pos) ** 2, dim=1)
+
+    objective_value = Wu * u_cost + Wp * tracking_cost + Wpt * terminal_cost
     return objective_value
 
 class SSL_MIQP_incorporated:
@@ -209,6 +213,8 @@ class SSL_MIQP_incorporated:
                 # warped forward pass
                 y_pred, u_opt, p_opt, s_opt, obj_val = self.forward(theta)
 
+                obj_val = obj_val.mean()
+
                 # Supervised loss from dataset
                 supervised_loss = supervised_loss_fn(y_pred, y_gt.float())
                 slack_pen = s_opt.sum(dim=1).mean()
@@ -258,6 +264,8 @@ class SSL_MIQP_incorporated:
 
                         # ---- Predict y from theta ----
                         y_pred, u_opt, p_opt, s_opt, obj_val = self.forward(theta)    
+
+                        obj_val = obj_val.mean()
 
                         supervised_loss = supervised_loss_fn(y_pred, y_gt.float())
 
@@ -330,7 +338,7 @@ class SSL_MIQP_incorporated:
         if wandb_log and started_wandb_run: 
             wandb.finish()          
 
-    def evaluate(self, data_loader, ground_truth_solver = None):
+    def evaluate(self, data_loader, ground_truth_solver = None, save_path="robot_nav/eval_results.pt"):
         """
         Evaluate the neural network model on given data.
         Args:
@@ -342,10 +350,16 @@ class SSL_MIQP_incorporated:
         device = self.device
         self.nn_model.to(device)
         self.nn_model.eval()
-        supervised_loss_fn = nn.HuberLoss() 
-        
-        obj_val_total = []; opt_obj_val_total = []
-        slack_pen_total = []; y_penalty_total = []; supervised_loss_total = []
+        supervised_loss_fn = nn.HuberLoss(reduction='none') 
+
+        obj_val_total = []
+        opt_obj_val_total = []
+        slack_pen_total = []
+        constraint_violation_total = []
+        violation_count_total = []
+        violation_percentage_total = []
+        supervised_loss_total = []
+        bit_accuracy_total = []
 
         with torch.no_grad():
             for theta, y_gt, pv_gt, u_gt in data_loader:
@@ -358,44 +372,68 @@ class SSL_MIQP_incorporated:
                 y_pred, u_opt, p_opt, s_opt, obj_val = self.forward(theta)
 
                 supervised_loss = supervised_loss_fn(y_pred, y_gt.float())
-                slack_pen = s_opt.sum(dim=1).mean()
+                supervised_loss = supervised_loss.view(B, -1).mean(dim=1)
+                slack_pen = s_opt.sum(dim=1)
                 y_transposed = NNoutput_reshape_torch(y_pred, N_obs=3) # (B, 3, 4, H)
-                y_penalty = constraint_violation_torch(y_transposed, p_opt[:, :2, :]).mean()
+                y_penalty = constraint_violation_torch(y_transposed, p_opt[:, :2, :])
+                violation_count = constraint_violation_count_torch(y_transposed, p_opt[:, :2, :])
+
+                total_constraints = (
+                    y_transposed.size(1) * y_transposed.size(2) * y_transposed.size(3)
+                    + y_transposed.size(1) * y_transposed.size(3)
+                )
+                violation_fraction = violation_count.float() / max(total_constraints, 1)
+                violation_percentage = violation_fraction * 100
+
+                binary_pred = (y_pred >= 0.5).float()
+                bit_accuracy = (binary_pred == y_gt.float()).float().view(B, -1).mean(dim=1)
                 
                 # Total loss with balanced weights
                 # loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
+                opt_obj_val = _obj_function(u_gt, pv_gt[:, :2, :], theta, meta=None)
 
-                opt_obj_val = _obj_function(u_gt, pv_gt[:, :2, :], theta, meta=None).mean()
+                obj_val_total.append(obj_val.detach().cpu())
+                opt_obj_val_total.append(opt_obj_val.detach().cpu())
+                slack_pen_total.append(slack_pen.detach().cpu())
+                constraint_violation_total.append(y_penalty.detach().cpu())
+                violation_count_total.append(violation_count.detach().cpu())
+                violation_percentage_total.append(violation_percentage.detach().cpu())
+                supervised_loss_total.append(supervised_loss.detach().cpu())
+                bit_accuracy_total.append(bit_accuracy.detach().cpu())
 
-                # Collect loss values
-                # val_loss_total.append(loss.item())       
-                obj_val_total.append(obj_val.item())
-                opt_obj_val_total.append(opt_obj_val.item())
-                slack_pen_total.append(slack_pen.item())
-                y_penalty_total.append(y_penalty.item())
-                supervised_loss_total.append(supervised_loss.item())
+        if not obj_val_total:
+            raise ValueError("No evaluation data provided.")
 
-        # Compute the averages
-        # avg_val_loss = torch.mean(torch.tensor(val_loss_total))
-        avg_obj_val = torch.mean(torch.tensor(obj_val_total))
-        opt_gap = 100*(torch.tensor(obj_val_total) - 
-                            torch.tensor(opt_obj_val_total))/torch.tensor(opt_obj_val_total).abs()
-        avg_opt_gap = opt_gap.mean()
-        avg_slack_pen = torch.mean(torch.tensor(slack_pen_total))
-        avg_y_penalty = torch.mean(torch.tensor(y_penalty_total))
-        avg_supervised_loss = torch.mean(torch.tensor(supervised_loss_total))
+        obj_vals = torch.cat(obj_val_total)
+        opt_obj_vals = torch.cat(opt_obj_val_total)
+        slack_penalties = torch.cat(slack_pen_total)
+        y_penalties = torch.cat(constraint_violation_total)
+        violation_counts = torch.cat(violation_count_total)
+        violation_percentages = torch.cat(violation_percentage_total)
+        supervised_losses = torch.cat(supervised_loss_total)
+        bit_accuracies = torch.cat(bit_accuracy_total)
+
+        optimality_gap = 100 * (obj_vals - opt_obj_vals) / opt_obj_vals.abs().clamp_min(1e-8)
 
         results = {
-            "avg_obj_val": avg_obj_val.item(),
-            "avg_optimality_gap": avg_opt_gap.item(),
-            "avg_slack_penalty": avg_slack_pen.item(),
-            "avg_y_penalty": avg_y_penalty.item(),
-            "avg_supervised_loss": avg_supervised_loss.item()
+            "obj_val": obj_vals,
+            "opt_obj_val": opt_obj_vals,
+            "slack_penalty": slack_penalties,
+            "y_penalty": y_penalties,
+            "constraint_violation_magnitude": y_penalties,
+            "constraint_violation_count": violation_counts,
+            "constraint_violation_percentage": violation_percentages,
+            "supervised_loss": supervised_losses,
+            "bit_accuracy": bit_accuracies,
+            "optimality_gap": optimality_gap,
         }
 
-        print("Evaluation Results:")
-        for key, value in results.items():
-            print(f"{key}: {value:.4f}")
+        save_dir = os.path.dirname(save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+
+        torch.save(results, save_path)
+        print(f"Saved evaluation results to {save_path}")
 
         return results
 
@@ -429,8 +467,8 @@ class SSL_MIQP_incorporated:
         u_opt = u_opt.to(device)
         p_opt = p_opt.to(device)
 
-        obj_val = _obj_function(u_opt, p_opt, theta.to(device), meta=None).mean()
-        obj_val += 1e4 * s_opt.sum(dim=1).mean()  # include slack penalty here
+        obj_val = _obj_function(u_opt, p_opt, theta.to(device), meta=None)
+        # obj_val = obj_val + 1e4 * s_opt.sum(dim=1)  # include slack penalty per-sample
 
         return y_pred, u_opt, p_opt, s_opt, obj_val
 
