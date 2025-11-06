@@ -91,6 +91,7 @@ def build_mpc_cvxpy_layer(
         Metadata describing parameter ordering and dimensions for future calls.
     """
     Wu, Wp, Wpt = map(float, weights)
+
     num_states = 2 * M
     horizon_vars = H + 1
     prepared_obs = _prepare_obstacles(obstacles)

@@ -3,7 +3,7 @@ import cvxpy as cp
 import torch
 from cvxpylayers.torch import CvxpyLayer
 
-def build_dpc_cvxpy_layer(N: int, use_soft: bool = False, slack_penalty: float = 1e3):
+def build_dpc_cvxpy_layer(N: int, slack_penalty: float = 1e3):
     # ---- Fixed system matrices (from the paper) ----
     alpha1, alpha2, nu = 0.9983, 0.9966, 0.001
     b1 = b2 = 0.075
@@ -30,10 +30,6 @@ def build_dpc_cvxpy_layer(N: int, use_soft: bool = False, slack_penalty: float =
     x_lo = torch.tensor([0.0, 0.0], dtype=torch.float32)
     x_hi = torch.tensor([8.4, 3.6], dtype=torch.float32)
     u_sum_hi = 8.0
-
-    # Soft penalty weights (used only if use_soft=True)
-    c_x = 25.0
-    c_u = 25.0
 
     # ---- CVXPY variables (decision) ----
     x = cp.Variable((N + 1, 2))
@@ -70,50 +66,32 @@ def build_dpc_cvxpy_layer(N: int, use_soft: bool = False, slack_penalty: float =
             E_c @ d_param[k, :]
         ]
 
-    # Input bounds: u >= 0, u1+u2 <= u_sum_hi (hard or soft)
+    # list to store all the objective terms
     obj_terms = []
 
-    slack_vars = None
-    slack_var = None
-    if use_soft:
-        # soft penalties: hinge^2 for state and input bounds
-        def hinge_sq(z):  # elementwise pos(z)^2
-            return cp.sum_squares(cp.pos(z))
+    # slack_var = None
+    # compact slack tensor storing all violations
+    slack_var = cp.Variable((N + 1 + N, 4), nonneg=True)
+    x_lo_slack = slack_var[: N + 1, 0:2]
+    x_hi_slack = slack_var[: N + 1, 2:4]
+    u_lo_slack = slack_var[N + 1 :, 0:2]
+    u_sum_slack = slack_var[N + 1 :, 2]
 
-        # state soft bounds for k=0..N (both sides)
-        for k in range(N + 1):
-            obj_terms += [c_x * hinge_sq(x_lo_c - x[k, :])]
-            obj_terms += [c_x * hinge_sq(x[k, :] - x_hi_c)]
-
-        # input soft bounds for k=0..N-1
-        for k in range(N):
-            obj_terms += [c_u * hinge_sq(-u[k, 0])]
-            obj_terms += [c_u * hinge_sq(-u[k, 1])]
-            obj_terms += [c_u * hinge_sq(u[k, 0] + u[k, 1] - u_sum_hi)]
-    else:
-        # compact slack tensor storing all violations
-        slack_var = cp.Variable((N + 1 + N, 4), nonneg=True)
-        x_lo_slack = slack_var[: N + 1, 0:2]
-        x_hi_slack = slack_var[: N + 1, 2:4]
-        u_lo_slack = slack_var[N + 1 :, 0:2]
-        u_sum_slack = slack_var[N + 1 :, 2]
-
-        # hard bounds as constraints
-        for k in range(N + 1):
-            cons += [
-                x[k, :] >= x_lo_c - x_lo_slack[k, :],
-                x[k, :] <= x_hi_c + x_hi_slack[k, :],
-            ]
-        for k in range(N):
-            cons += [
-                u[k, 0] >= -u_lo_slack[k, 0],
-                u[k, 1] >= -u_lo_slack[k, 1],
-                u[k, 0] + u[k, 1] <= u_sum_hi + u_sum_slack[k],
-            ]
-
-        obj_terms += [
-            slack_penalty * cp.sum_squares(slack_var),
+    # hard bounds as constraints
+    # Input bounds: u >= 0, u1+u2 <= u_sum_hi (hard or soft)
+    for k in range(N + 1):
+        cons += [
+            x[k, :] >= x_lo_c - x_lo_slack[k, :],
+            x[k, :] <= x_hi_c + x_hi_slack[k, :],
         ]
+    for k in range(N):
+        cons += [
+            u[k, 0] >= -u_lo_slack[k, 0],
+            u[k, 1] >= -u_lo_slack[k, 1],
+            u[k, 0] + u[k, 1] <= u_sum_hi + u_sum_slack[k],
+        ]
+
+    obj_terms += [slack_penalty * cp.sum(slack_var)] # l1 penalty 
 
     # ---- Objective: quadratic tracking + control effort + rho*delta^2 + terminal
     # stage cost

@@ -4,8 +4,6 @@ import torch.nn as nn
 import numpy as np
 import cvxpy as cp
 import wandb
-import random
-
 
 # Define some penalty functions that we may use
 l1_penalty = lambda s: s.sum(dim=1)
@@ -57,18 +55,18 @@ def _obj_function(u_opt, x_opt, y, meta=None):
     
     # Integer variable penalty: sum_k rho * delta_k^2
     if y.dim() == 2:  # (B, H)
-        integer_penalty = rho * (y ** 2).sum(dim=1)  # (B,)
+        integer_cost = rho * (y ** 2).sum(dim=1)  # (B,)
     elif y.dim() == 3:  # (B, H, 1) or similar
-        integer_penalty = rho * (y ** 2).sum(dim=[1, 2])  # (B,)
+        integer_cost = rho * (y ** 2).sum(dim=[1, 2])  # (B,)
     else:
-        integer_penalty = torch.zeros(B, device=device)
+        integer_cost = torch.zeros(B, device=device)
     
     # Terminal cost: (x_N - x_ref)^T P (x_N - x_ref)
     terminal_error = x_opt[:, -1, :] - x_ref[:, -1, :]  # (B, 2)
     terminal_cost = torch.einsum('bi,ij,bj->b', terminal_error, P, terminal_error)
     
     # Total objective
-    obj = state_cost + control_cost + integer_penalty + terminal_cost  # (B,)
+    obj = state_cost + control_cost + integer_cost + terminal_cost  # (B,)
     return obj
 
 class SSL_MIQPP_Trainer:
@@ -90,9 +88,8 @@ class SSL_MIQPP_Trainer:
 
     def train_SL(self, train_loader, test_loader, training_params, wandb_log = False):
         """
-        Train the neural network model using supervised learning.
+        Train the neural network model purely using supervised learning.
         Args:
-            ground_truth_solver: Function to get ground truth solutions.
             train_loader: DataLoader for training data.
             test_loader: DataLoader for testing data.
             training_params: Dictionary containing training parameters.
@@ -128,9 +125,8 @@ class SSL_MIQPP_Trainer:
                 theta = theta.to(device)
                 y_gt = y_gt.to(device)
 
-                # B = theta_batch.shape[0] # batch size
                 # ---- Predict y from theta ----
-                y_pred = self.nn_model(theta).float() # (B, ny), hard {0,1}
+                y_pred = self.nn_model(theta).float() 
                 supervised_loss = supervised_loss_fn(y_pred, y_gt.float())
                 loss = supervised_loss
                 if wandb_log: wandb.log({
@@ -154,7 +150,7 @@ class SSL_MIQPP_Trainer:
                             theta = theta.to(device)
                             y_gt = y_gt.to(device)
                             # ---- Predict y from theta ----
-                            y_pred_test = self.nn_model(theta).float() # (B, ny), hard {0,1}
+                            y_pred_test = self.nn_model(theta).float()
                             val_loss_total += supervised_loss_fn(y_pred_test, y_gt.float()).item()                           
                         avg_val_loss = val_loss_total / len(test_loader)
 
@@ -174,19 +170,19 @@ class SSL_MIQPP_Trainer:
                         print(f"Learning rate updated: {last_lr:.6f} -> {current_lr:.6f}")
                         last_lr = current_lr
 
-                    # if avg_val_loss < best_val_loss:
-                    #     best_val_loss = avg_val_loss
-                    #     epochs_no_improve = 0
-                    # else:
-                    #     epochs_no_improve += 1
-                    #     if epochs_no_improve >= PATIENCE:
-                    #         print("Early stopping triggered!")
-                    #         return
+                    if avg_val_loss < best_val_loss:
+                        best_val_loss = avg_val_loss
+                        epochs_no_improve = 0
+                    else:
+                        epochs_no_improve += 1
+                        if epochs_no_improve >= PATIENCE:
+                            print("Early stopping triggered!")
+                            return
+                        
         if wandb_log: wandb.finish()
                     
     def train_SSL(self, train_loader, test_loader, training_params, loss_weights, 
-            loss_scale = 1.0, 
-            wandb_log = False):
+            loss_scale = 1.0, wandb_log = False):
         """
         Train the neural network model using self-supervised learning.
         Args:
@@ -195,6 +191,7 @@ class SSL_MIQPP_Trainer:
             test_loader: DataLoader for testing data.
             training_params: Dictionary containing training parameters.
             loss_weights: List of weights for different loss components.
+            loss_scale: a factor to scale the loss 
             obj_fcn: Function to compute objective value given (x, y).
             y_cons: List of functions to compute constraint violations only on y (integer variables).
             slack_penalty: Function to compute penalty on slack variables.
@@ -238,17 +235,13 @@ class SSL_MIQPP_Trainer:
             for theta, y_gt, _, _ in train_loader:
                 theta = theta.to(device)
                 y_gt = y_gt.to(device)
-                
                 # warped forward pass
                 y_pred, u_opt, x_opt, s_opt, obj_val = self.forward(theta)
-
                 # Supervised loss from dataset
                 supervised_loss = supervised_loss_fn(y_pred, y_gt.float())
                 slack_pen = s_opt.sum(dim=1).mean()
-                
                 y_penalty = torch.tensor(0.0, device=device)
                 # Total loss with balanced weights
-                # loss = supervised_loss
                 loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
                 if wandb_log: wandb.log({
                     "train/combined_loss": loss.item(),
@@ -278,7 +271,6 @@ class SSL_MIQPP_Trainer:
                     val_loss_total = []; obj_val_total = []; opt_obj_val_total = []
                     slack_pen_total = []; y_penalty_total = []
                     supervised_loss_total = []
-
                 
                     with torch.no_grad():
                         # for theta, y_gt, pv_gt, u_gt in test_loader:
@@ -289,8 +281,7 @@ class SSL_MIQPP_Trainer:
                         u_gt = u_gt.to(device)
 
                         # ---- Predict y from theta ----
-                        y_pred, u_opt, p_opt, s_opt, obj_val = self.forward(theta)    
-
+                        y_pred, u_opt, x_opt, s_opt, obj_val = self.forward(theta)    
                         supervised_loss = supervised_loss_fn(y_pred, y_gt.float())
 
                         # Slack penalty included inside cvx_layer.solve
@@ -459,6 +450,6 @@ class SSL_MIQPP_Trainer:
         x_opt = x_opt.to(device)
 
         obj_val = _obj_function(u_opt, x_opt, y_pred, meta=None).mean()
-        obj_val += 1e4 * s_opt.sum(dim=1).mean()  # include slack penalty here
+        # obj_val += 1e3 * s_opt.sum(dim=1).mean()  # include slack penalty here
 
         return y_pred, u_opt, x_opt, s_opt, obj_val

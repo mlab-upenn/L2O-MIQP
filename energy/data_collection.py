@@ -38,7 +38,6 @@ U_SUM_HI = 8.0
 C_X = 25.0
 C_U = 25.0
 
-
 @dataclass
 class Spec:
     N: int
@@ -134,13 +133,13 @@ def solve_one(x0: np.ndarray, d_seq: np.ndarray, spec: Spec, env: gp.Env) -> Dic
         if x_slacks is not None:
             xvlo, xvhi = x_slacks
             for i in range(2):
-                obj += float(spec.c_x) * xvlo[k,i] * xvlo[k,i]
-                obj += float(spec.c_x) * xvhi[k,i] * xvhi[k,i]
+                obj += float(spec.c_x) * xvlo[k,i]
+                obj += float(spec.c_x) * xvhi[k,i]
         if u_slacks is not None:
             v1, v2, vs = u_slacks
-            obj += float(spec.c_u) * v1[k] * v1[k]
-            obj += float(spec.c_u) * v2[k] * v2[k]
-            obj += float(spec.c_u) * vs[k] * vs[k]
+            obj += float(spec.c_u) * v1[k]
+            obj += float(spec.c_u) * v2[k]
+            obj += float(spec.c_u) * vs[k]
 
     # terminal
     for i in range(2):
@@ -159,6 +158,7 @@ def solve_one(x0: np.ndarray, d_seq: np.ndarray, spec: Spec, env: gp.Env) -> Dic
     # assemble outputs
     ok = (m.Status in (GRB.OPTIMAL, GRB.TIME_LIMIT)) and (m.SolCount > 0)
     if not ok:
+        print("The problem is infeasible !!!")
         return {
             "ok": False, "status": int(m.Status), "relaxed": relaxed,
             "X": None, "Y": None, "Z": None
@@ -193,7 +193,6 @@ def solve_one(x0: np.ndarray, d_seq: np.ndarray, spec: Spec, env: gp.Env) -> Dic
         "Z": Z_aux,
     }
 
-
 # ---------------- Public API ----------------
 def build_dataset(
     num_samples: int,
@@ -214,6 +213,9 @@ def build_dataset(
       Z: dict of arrays/lists {u_trj: (S, N, 2), x_trj: (S, N+1, 2), obj: (S,)}
       status: (S,) Gurobi status codes
     """
+    if c_x is None and c_u is None:
+        print("We consider hard constraints while collecting data !!!")
+
     rng = np.random.default_rng(seed)
     spec = Spec(N=N, c_x=c_x, c_u=c_u, time_limit=time_limit, y_one_hot=y_one_hot)
 
@@ -248,25 +250,15 @@ def build_dataset(
             d_seq[start:start+dur, 1] += amp
 
         res = solve_one(x0, d_seq, spec, env)
-        STAT_list.append(res["status"])
-        RELAX_list.append(bool(res.get("relaxed", False)))
-        if not res["ok"]:
-            # store placeholders
-            X_list.append(np.concatenate([x0, d_seq.reshape(-1)], 0))
-            if y_one_hot:
-                Y_list.append(np.zeros((N,4), dtype=np.float32))
-            else:
-                Y_list.append(np.full((N,), -1, dtype=np.int64))
-            U_list.append(np.zeros((N,2), dtype=float))
-            Xtraj_list.append(np.zeros((N+1,2), dtype=float))
-            OBJ_list.append(np.nan)
-            continue
 
-        X_list.append(res["X"])
-        Y_list.append(res["Y"])
-        U_list.append(res["Z"]["u_trj"])
-        Xtraj_list.append(res["Z"]["x_trj"])
-        OBJ_list.append(res["Z"]["obj"])
+        if res["ok"]: # just ignore the sample if it does not have a solution
+            STAT_list.append(res["status"])
+            RELAX_list.append(bool(res.get("relaxed", False)))
+            X_list.append(res["X"])
+            Y_list.append(res["Y"])
+            U_list.append(res["Z"]["u_trj"])
+            Xtraj_list.append(res["Z"]["x_trj"])
+            OBJ_list.append(res["Z"]["obj"])
 
     # stack
     X = np.stack(X_list, axis=0)                                 # (S, 2+2N)
@@ -317,7 +309,7 @@ def build_dataset(
 if __name__ == "__main__":
     # Build a small silent dataset (no prints)
     data = build_dataset(
-        num_samples=10000,
+        num_samples=30000,
         N=20,
         seed=114514,
         c_x=None, c_u=None,         # None/None -> hard bounds
