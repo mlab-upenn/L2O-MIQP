@@ -184,7 +184,9 @@ def constraint_violation_count_torch(dis_traj, cont_traj, Obs_info=None, toleran
     c5_violations = (shortfall > tolerance).sum(dim=(1, 2))
 
     violation_count = c_violations + c5_violations
+    constraint_count = c.numel() + shortfall.numel()
+    violation_rate = violation_count/constraint_count
 
     if squeeze_batch:
         return violation_count.squeeze(0)
-    return violation_count
+    return violation_count, violation_rate
