@@ -8,7 +8,7 @@ from trainer import *
 from cvxpy_mpc_layer import *
 from Robots import obstacle
 
-def prepare_data():
+def prepare_data(seed=42):
     relative_path = os.getcwd()
     relative_path = os.path.abspath("..")
     dataset_fn = relative_path + '/robot_nav/data' + '/single.p'
@@ -86,6 +86,7 @@ def prepare_data():
     dataset = torch.utils.data.TensorDataset(X_tensor, Y_tensor, P_tensor, Pu_tensor)
 
     from torch.utils.data import random_split
+    torch.manual_seed(seed)
 
     n_train = int(0.9 * len(dataset))
     n_test = len(dataset) - n_train

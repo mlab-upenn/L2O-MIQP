@@ -13,3 +13,5 @@ L2O_MIQP.egg-info/
 .venv/
 .env
 .vscode/
+
+*.pth

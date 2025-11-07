@@ -13,3 +13,6 @@ training:
   WANDB_PROJECT: l2o_ssl_miqp_energy
   RUN_NAME_PREFIX: ssl_
 
+save_stats:
+  enabled: true
+  filename: results/energy_supervised
