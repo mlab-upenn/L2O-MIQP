@@ -38,7 +38,7 @@ def prepare_data():
         X_test_tensor, Y_test_tensor, Xtraj_test_tensor, U_test_tensor
     )
 
-    batch_size = 256
+    batch_size = 128
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True
     )
