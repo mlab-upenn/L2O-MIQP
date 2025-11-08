@@ -1,11 +1,11 @@
 weights:
-  w_obj: 1e-5
-  w_slack: 1.0
+  w_obj: 0.0
+  w_slack: 0.0
   w_con: 0.0
-  w_sup: 1e5
+  w_sup: 1e0
 
 training:
-  TRAINING_EPOCHS: 20
+  TRAINING_EPOCHS: 0
   CHECKPOINT_AFTER: 50
   LEARNING_RATE: 1e-3
   WEIGHT_DECAY: 1e-5
@@ -15,4 +15,4 @@ training:
 
 save_stats:
   enabled: true
-  filename: results/energy_supervised
+  filename: energy_supervised

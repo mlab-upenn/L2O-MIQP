@@ -9,9 +9,10 @@ wandb
 wandb/
 self_supervised/wandb/
 L2O_MIQP.egg-info/
-
+misc.ipynb
 .venv/
 .env
 .vscode/
 
 *.pth
+*.pdf

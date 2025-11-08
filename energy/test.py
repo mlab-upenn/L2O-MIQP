@@ -49,7 +49,13 @@ def prepare_data():
     return train_loader, test_loader
 
 def main():
-    filename, loss_weights, training_params = load_yaml_config("train_config.yaml")
+    # ---------------------------------------------- #
+    # Either of the following ways to load config
+    # ---------------------------------------------- #
+    # This one is useful for running the script once
+    # filenames, loss_weights, training_params = load_yaml_config("train_config.yaml")
+    # This one is useful for running the script multiple times sequentially using .sh
+    filenames, loss_weights, training_params = load_argparse_config()
 
     train_loader, test_loader = prepare_data()
     cp_layer = build_dpc_cvxpy_layer(N = 20)
@@ -72,12 +78,13 @@ def main():
         training_params=training_params,
         loss_weights=loss_weights,
         loss_scale=10.0,
-        wandb_log=True
+        wandb_log=False
     )
 
-    torch.save(Trainer_SSL.nn_model.state_dict(), "results/nn_model_ssl.pth")
+    Trainer_SSL.evaluate(test_loader, save_path = filenames[0])
+    torch.save(Trainer_SSL.nn_model.state_dict(), filenames[1])
 
-    Trainer_SSL.evaluate(test_loader, save_path=filename)
+    print("\033[31;42m FINISHED \033[0m")
 
 if __name__ == "__main__":
     main()

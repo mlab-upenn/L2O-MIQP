@@ -288,7 +288,7 @@ class SSL_MIQP_incorporated:
                         # Compute the averages
                         avg_val_loss = torch.mean(torch.tensor(val_loss_total))
                         avg_obj_val = torch.mean(torch.tensor(obj_val_total))
-                        avg_opt_obj_val = torch.mean(torch.tensor(opt_obj_val))
+                        avg_opt_obj_val = torch.mean(torch.tensor(opt_obj_val_total))
                         opt_gap = 100*(torch.tensor(obj_val_total) - 
                             torch.tensor(opt_obj_val_total))/torch.tensor(opt_obj_val_total).abs()
                         avg_opt_gap = opt_gap.mean()
@@ -299,7 +299,6 @@ class SSL_MIQP_incorporated:
                     print(f"[epoch {epoch} | step {global_step}] "
                         f"validation: loss = {avg_val_loss:.4f}, "
                         f"obj_val = {avg_obj_val:.4f}, "
-                        f"opt_obj_val = {avg_opt_obj_val:.4f}, "
                         f"opt_gap = {avg_opt_gap:.4f} %, "
                         f"slack_pen = {avg_slack_pen:.4f}, "
                         f"y_penalty = {avg_y_penalty:.4f}, "

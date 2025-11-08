@@ -15,10 +15,10 @@ def prepare_data(seed=42):
     prob_features = ['x0', 'xg']
 
     data_file = open(dataset_fn,'rb')
-    all_data = pickle.load(data_file)[:100000]  # use only part of the dataset for quick testing
+    all_data = pickle.load(data_file) # [:100000] use only part of the dataset for quick testing
     data_file.close()
     num_train = len(all_data)
-    print(f"Number of training samples: {num_train}")
+    # print(f"Number of training samples: {num_train}")
 
     X0 = np.vstack([all_data[ii]['x0'].T for ii in range(num_train)])  
     XG = np.vstack([all_data[ii]['xg'].T for ii in range(num_train)])  
@@ -152,7 +152,7 @@ def main():
     # This one is useful for running the script once
     # filename, loss_weights, training_params = load_yaml_config("train_config.yaml")
     # This one is useful for running the script multiple times sequentially using .sh
-    filename, loss_weights, training_params = load_argparse_config()
+    filenames, loss_weights, training_params = load_argparse_config()
 
     train_loader, test_loader, n_features, n_y, n_obs, Obs_info = prepare_data()
 
@@ -178,7 +178,8 @@ def main():
         loss_scale = 10.0,
         wandb_log = False)
     
-    _ = Model_SSL.evaluate(test_loader, save_path=filename)
+    _ = Model_SSL.evaluate(test_loader, save_path = filenames[0])
+    torch.save(Model_SSL.nn_model.state_dict(), filenames[1])
 
     print("\033[31;42m FINISHED \033[0m")
 

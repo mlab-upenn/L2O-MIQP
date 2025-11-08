@@ -6,9 +6,10 @@ def load_yaml_config(yaml_file):
     cfg = yaml.safe_load(open(yaml_file))
     # Create filename if we want to save the statistics
     if cfg["save_stats"]["enabled"]:
-        filename = cfg["save_stats"]["filename"] + ".pt"
-    else: 
-        filename = None
+        base_filename = cfg["save_stats"]["filename"]
+        filenames =  ["stats_" + base_filename + ".pt", "model_" + base_filename + ".pth"] 
+    else:
+        filenames = [None]*2
     # loss weights
     weights = cfg["weights"]
     obj_weight = float(weights["w_obj"])
@@ -27,7 +28,7 @@ def load_yaml_config(yaml_file):
     now = datetime.datetime.now()
     dt_string = now.strftime("%Y%m%d_%H%M%S")
     training_params['RUN_NAME'] = "ssl_" + dt_string
-    return filename, loss_weights, training_params
+    return filenames, loss_weights, training_params
 
 def load_argparse_config():
     parser = argparse.ArgumentParser()
@@ -42,11 +43,11 @@ def load_argparse_config():
     parser.add_argument("--LEARNING_RATE", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--WEIGHT_DECAY", type=float, default=1e-5, help="Weight decay for optimizer")
     parser.add_argument("--PATIENCE", type=int, default=10, help="Early stopping patience")
-    parser.add_argument("--WANDB_PROJECT", type=str, default="l2o_ssl_miqp_robot_nav", help="WandB project name")
-    parser.add_argument("--RUN_NAME_PREFIX", type=str, default="ssl_", help="Prefix for run name")
+    parser.add_argument("--WANDB_PROJECT", type=str, default="l2o_miqp", help="WandB project name")
+    parser.add_argument("--RUN_NAME_PREFIX", type=str, default="l2o_miqp_", help="Prefix for run name")
     # Save statistics
     parser.add_argument("--save_stats", action="store_true", help="Enable saving training statistics")
-    parser.add_argument("--filename", type=str, default="robot_nav", help="Filename for saved stats")
+    parser.add_argument("--filename", type=str, default="example.pt", help="Filename for saved stats")
 
     arg = parser.parse_args()
     loss_weights = [arg.w_obj, arg.w_slack, arg.w_con, arg.w_sup]
@@ -61,7 +62,9 @@ def load_argparse_config():
     training_params['RUN_NAME'] = "ssl_" + dt_string
     training_params['WANDB_PROJECT'] = arg.WANDB_PROJECT
     training_params['RUN_NAME_PREFIX'] = arg.RUN_NAME_PREFIX
-
-    filename = arg.filename if arg.save_stats else None
-
-    return filename, loss_weights, training_params
+    if arg.save_stats:
+        base_filename = arg.filename
+        filenames =  ["stats_" + base_filename + ".pt", "model_" + base_filename + ".pth"] 
+    else:
+        filenames = [None]*2
+    return filenames, loss_weights, training_params
