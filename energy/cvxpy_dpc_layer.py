@@ -77,6 +77,7 @@ def build_dpc_cvxpy_layer(N: int, slack_penalty: float = 1e3):
     x_hi_slack = slack_var[:, 2:4]
     # u_lo_slack = slack_var[N + 1 :, 0:2]
     # u_sum_slack = slack_var[N + 1 :, 2]
+    d_delta_slack = cp.Variable((N - 1, 2), nonneg=True)
 
     # hard bounds as constraints
     # Input bounds: u >= 0, u1+u2 <= u_sum_hi (hard or soft)
@@ -91,8 +92,14 @@ def build_dpc_cvxpy_layer(N: int, slack_penalty: float = 1e3):
             u[k, 1] >= 0.0, # -u_lo_slack[k, 1],
             u[k, 0] + u[k, 1] <= u_sum_hi, # + u_sum_slack[k],
         ]
+        # constraint on delta_change_rate
+        if k < N-1:
+            cons += [
+                u[k+1, 1] - u[k, 1] + 1 >= - d_delta_slack[k, 0],
+                u[k+1, 1] - u[k, 1] - 1 <= d_delta_slack[k, 1],
+            ]            
 
-    obj_terms += [slack_penalty * cp.sum(slack_var)] # l1 penalty 
+    obj_terms += [slack_penalty * (cp.sum(slack_var) + cp.sum(d_delta_slack))] # l1 penalty 
 
     # ---- Objective: quadratic tracking + control effort + rho*delta^2 + terminal
     # stage cost

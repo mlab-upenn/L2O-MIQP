@@ -1,5 +1,27 @@
 import torch
 
+def obj_function(u_opt, p_opt, theta, meta):
+    """
+    Example objective function computation.
+    Args:
+        u_opt: Optimal control inputs (B, nu, H)
+        p_opt: Optimal positions (B, 2, H)
+        x: Initial states (B, nx)
+        meta: Dictionary containing objective parameters
+    Returns:
+        Objective value tensor of shape (B,).
+    """
+    Wu, Wp, Wpt = 1.0, 1.0, 10.0
+
+    u_cost = torch.sum(u_opt ** 2, dim=(1, 2))
+    target_pos = theta[:, 4:]
+    tracking_target = target_pos.unsqueeze(-1).expand_as(p_opt[:, :, :-1])
+    tracking_cost = torch.sum((p_opt[:, :, :-1] - tracking_target) ** 2, dim=(1, 2))
+    terminal_cost = torch.sum((p_opt[:, :, -1] - target_pos) ** 2, dim=1)
+
+    objective_value = Wu * u_cost + Wp * tracking_cost + Wpt * terminal_cost
+    return objective_value
+
 # torch version of the function above
 def NNoutput_reshape_torch(outputs: torch.Tensor, N_obs: int):
     """Reshape NN outputs to (N_obs, 4, H) or (B, N_obs, 4, H)."""
@@ -31,7 +53,7 @@ def NNoutput_reshape_torch(outputs: torch.Tensor, N_obs: int):
     raise ValueError("Unexpected output shape for NNoutput_reshape_torch")
 
 # torch version of the function above
-def constraint_violation_torch(dis_traj, cont_traj, Obs_info=None):
+def constraint_violation_torch(dis_traj, cont_traj, Obs_info=None, evaluate = False):
     """
     dis_traj: (N_obs, 4, H) or (B, N_obs, 4, H)
     cont_traj: (2, H) or (B, 2, H)
@@ -99,8 +121,13 @@ def constraint_violation_torch(dis_traj, cont_traj, Obs_info=None):
     c = torch.relu(proj - thresholds - bigM * (1 - d))
     c5 = torch.relu(1 - d.sum(dim=2))
 
-    violation = c.sum(dim=(1, 2, 3)) + c5.sum(dim=(1, 2))
+    con_violation = c.sum(dim=(1, 2, 3))
+    dis_violation = c5.sum(dim=(1, 2))
 
+    violation = con_violation + dis_violation
+    if evaluate:
+        return con_violation, dis_violation
+    
     if squeeze_batch:
         return violation.squeeze(0)
     return violation

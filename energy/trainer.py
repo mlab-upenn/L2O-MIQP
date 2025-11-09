@@ -5,6 +5,7 @@ import torch.nn as nn
 import numpy as np
 import cvxpy as cp
 import wandb
+from cons_utils import *
 
 # Define some penalty functions that we may use
 l1_penalty = lambda s: s.sum(dim=1)
@@ -17,58 +18,6 @@ def combined_loss_fcn(loss_components, weights):
     assert len(loss_components) == len(weights), "Number of loss components must match number of weights."
     combined_loss = sum(w * lc for w, lc in zip(weights, loss_components))
     return combined_loss
-
-def _obj_function(u_opt, x_opt, y, meta=None):
-    """
-    Example objective function computation.
-    Args:
-        u_opt: Optimal control inputs (B, H, 2)
-        x_opt: Optimal states (B, H+1, 2)
-        y: integer variables (B, H) - delta values in {0,1,2,3}
-        meta: Dictionary containing objective parameters
-    Returns:
-        Objective value tensor (B,).
-    """
-    device = u_opt.device
-    B, H, _ = u_opt.shape
-    
-    # Default weights (from data_collection.py)
-    if meta is None:
-        Q = torch.eye(2, device=device)           # state cost
-        R = torch.eye(2, device=device) * 0.5           # control cost
-        P = torch.eye(2, device=device)           # terminal cost
-        rho = torch.tensor(0.1, device=device)    # integer variable penalty
-        x_ref = torch.tensor([4.2, 1.8], device=device).view(1, 1, 2).expand(B, H+1, 2)
-    else:
-        Q = meta.get('Q', torch.eye(2)).to(device)
-        R = meta.get('R', torch.eye(2)).to(device)
-        P = meta.get('P', torch.eye(2)).to(device)
-        rho = meta.get('rho', torch.tensor(0.1)).to(device)
-        x_ref = meta.get('x_ref', torch.tensor([4.2, 1.8], device=device).view(1, 1, 2).expand(B, H+1, 2)).to(device)
-    
-    # Stage costs over horizon (k = 0 to H-1)
-    # State cost: sum_k (x_k - x_ref)^T Q (x_k - x_ref)
-    state_error = x_opt[:, :-1, :] - x_ref[:, :-1, :]  # (B, H, 2) - exclude terminal state
-    state_cost = torch.einsum('bhi,ij,bhj->b', state_error, Q, state_error)
-    
-    # Control cost: sum_k u_k^T R u_k
-    control_cost = torch.einsum('bhi,ij,bhj->b', u_opt, R, u_opt)
-    
-    # Integer variable penalty: sum_k rho * delta_k^2
-    if y.dim() == 2:  # (B, H)
-        integer_cost = rho * (y ** 2).sum(dim=1)  # (B,)
-    elif y.dim() == 3:  # (B, H, 1) or similar
-        integer_cost = rho * (y ** 2).sum(dim=[1, 2])  # (B,)
-    else:
-        integer_cost = torch.zeros(B, device=device)
-    
-    # Terminal cost: (x_N - x_ref)^T P (x_N - x_ref)
-    terminal_error = x_opt[:, -1, :] - x_ref[:, -1, :]  # (B, 2)
-    terminal_cost = torch.einsum('bi,ij,bj->b', terminal_error, P, terminal_error)
-    
-    # Total objective
-    obj = state_cost + control_cost + integer_cost + terminal_cost  # (B,)
-    return obj
 
 class SSL_MIQPP_Trainer:
 
@@ -243,7 +192,7 @@ class SSL_MIQPP_Trainer:
                 # Supervised loss from dataset
                 supervised_loss = supervised_loss_fn(y_pred, y_gt.float())
                 slack_pen = s_opt.sum(dim=1).mean()
-                y_penalty = torch.tensor(0.0, device=device)
+                y_penalty = constraint_violation_torch(y_pred, x_opt).mean()
                 # Total loss with balanced weights
                 loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
                 if wandb_log: wandb.log({
@@ -290,12 +239,12 @@ class SSL_MIQPP_Trainer:
                         obj_val = obj_val.mean()
                         # Slack penalty included inside cvx_layer.solve
                         slack_pen = s_opt.sum(dim=1).mean()
-                        y_penalty = torch.tensor(0.0, device=device)
+                        y_penalty = constraint_violation_torch(y_pred, x_opt).mean()
             
                         # Total loss with balanced weights
                         loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
 
-                        opt_obj_val = _obj_function(u_gt, x_gt, y_gt, meta=None).mean()
+                        opt_obj_val = obj_function(u_gt, x_gt, y_gt, meta=None).mean()
 
                         # Collect loss values
                         val_loss_total.append(loss.item())       
@@ -373,6 +322,7 @@ class SSL_MIQPP_Trainer:
         obj_val_total = []
         opt_obj_val_total = []
         slack_pen_total = []
+        y_pen_total = []
         supervised_loss_total = []
         bit_accuracy_total = []
 
@@ -387,22 +337,21 @@ class SSL_MIQPP_Trainer:
                 y_pred, u_opt, x_opt, s_opt, obj_val = self.forward(theta)
 
                 supervised_loss = supervised_loss_fn(y_pred, y_gt.float()).view(B, -1).mean(dim=1)
-                slack_pen = s_opt.reshape(B, -1).sum(dim=1)
-                y_penalty = torch.tensor(0.0, device=device)
-
+                slack_pen, y_penalty = constraint_violation_torch(y_pred, x_opt, evaluate=True) 
                 pred_labels = torch.round(y_pred).long()
                 bit_accuracy = (pred_labels == y_gt.long()).float().view(B, -1).mean(dim=1)
 
                 # Total loss with balanced weights
                 # loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
 
-                opt_obj_val = _obj_function(u_gt, x_gt, y_gt, meta=None)
+                opt_obj_val = obj_function(u_gt, x_gt, y_gt, meta=None)
 
                 # Collect loss values
                 # val_loss_total.append(loss.item())       
                 obj_val_total.append(obj_val.detach().cpu())
                 opt_obj_val_total.append(opt_obj_val.detach().cpu())
                 slack_pen_total.append(slack_pen.detach().cpu())
+                y_pen_total.append(y_penalty.detach().cpu())
                 supervised_loss_total.append(supervised_loss.detach().cpu())
                 bit_accuracy_total.append(bit_accuracy.detach().cpu())
 
@@ -412,19 +361,27 @@ class SSL_MIQPP_Trainer:
         obj_vals = torch.cat(obj_val_total)
         opt_obj_vals = torch.cat(opt_obj_val_total)
         slack_penalties = torch.cat(slack_pen_total)
+        y_penalties = torch.cat(y_pen_total)
         supervised_losses = torch.cat(supervised_loss_total)
         bit_accuracies = torch.cat(bit_accuracy_total)
-
-        optimality_gap = 100 * (obj_vals - opt_obj_vals) / opt_obj_vals.abs().clamp_min(1e-8)
-
+        # Added a constant to make the opt gap not crazy
+        optimality_gap = 100 * (obj_vals - opt_obj_vals) / (1e2 + opt_obj_vals.abs())
         results = {
             "obj_val": obj_vals,
             "opt_obj_val": opt_obj_vals,
             "optimality_gap": optimality_gap,
             "slack_penalty": slack_penalties,
+            "y_penalty": y_penalties,
             "supervised_loss": supervised_losses,
             "bit_accuracy": bit_accuracies,
         }
+
+        print("=== Evaluation Summary ===")
+        for key, value in results.items():
+            if hasattr(value, "mean"):  # e.g. tensor or array
+                print(f"{key:20s}: mean = {value.mean():.4f}, std = {value.std():.4f}")
+            else:
+                print(f"{key:20s}: {value}")
 
         save_dir = os.path.dirname(save_path)
         if save_dir:
@@ -464,7 +421,7 @@ class SSL_MIQPP_Trainer:
         u_opt = u_opt.to(device)
         x_opt = x_opt.to(device)
 
-        obj_val = _obj_function(u_opt, x_opt, y_pred, meta=None)
+        obj_val = obj_function(u_opt, x_opt, y_pred, meta=None)
         # obj_val += 1e3 * s_opt.sum(dim=1).mean()  # include slack penalty here
 
         return y_pred, u_opt, x_opt, s_opt, obj_val

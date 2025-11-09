@@ -68,6 +68,10 @@ def solve_one(x0: np.ndarray, d_seq: np.ndarray, spec: Spec, env: gp.Env) -> Dic
     for k in range(N):
         m.addConstr(delta[k] >= 0)
         m.addConstr(delta[k] <= 3)
+        # Want to test if we include constraints for the integer variables
+        if k < N-1:
+            m.addConstr(delta[k+1] - delta[k] >= -1)
+            m.addConstr(delta[k+1] - delta[k] <= 1)
 
     # init
     m.addConstr(x[0,0] == float(x0[0]))
@@ -148,19 +152,20 @@ def solve_one(x0: np.ndarray, d_seq: np.ndarray, spec: Spec, env: gp.Env) -> Dic
 
     m.setObjective(obj, GRB.MINIMIZE)
     m.optimize()
-    relaxed = False
 
-    if m.Status in (GRB.INFEASIBLE, GRB.INF_OR_UNBD):
-        relaxed = True
-        m.feasRelaxS(1, False, True, True)
-        m.optimize()
+    # # Uncomment it if we wanna get the relaxed solution
+    # relaxed = False
+    # if m.Status in (GRB.INFEASIBLE, GRB.INF_OR_UNBD):
+    #     relaxed = True
+    #     m.feasRelaxS(1, False, True, True)
+    #     m.optimize()
 
     # assemble outputs
     ok = (m.Status in (GRB.OPTIMAL, GRB.TIME_LIMIT)) and (m.SolCount > 0)
     if not ok:
-        print("The problem is infeasible !!!")
+        # print("The problem is infeasible !!!")
         return {
-            "ok": False, "status": int(m.Status), "relaxed": relaxed,
+            "ok": False, "status": int(m.Status),
             "X": None, "Y": None, "Z": None
         }
 
@@ -187,7 +192,6 @@ def solve_one(x0: np.ndarray, d_seq: np.ndarray, spec: Spec, env: gp.Env) -> Dic
     return {
         "ok": True,
         "status": int(m.Status),
-        "relaxed": relaxed,
         "X": X_feat,
         "Y": Y_lbl,
         "Z": Z_aux,
@@ -253,7 +257,6 @@ def build_dataset(
 
         if res["ok"]: # just ignore the sample if it does not have a solution
             STAT_list.append(res["status"])
-            RELAX_list.append(bool(res.get("relaxed", False)))
             X_list.append(res["X"])
             Y_list.append(res["Y"])
             U_list.append(res["Z"]["u_trj"])
@@ -309,7 +312,7 @@ def build_dataset(
 if __name__ == "__main__":
     # Build a small silent dataset (no prints)
     data = build_dataset(
-        num_samples=30000,
+        num_samples=int(1e5),
         N=20,
         seed=114514,
         c_x=None, c_u=None,         # None/None -> hard bounds

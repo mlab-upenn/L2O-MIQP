@@ -20,28 +20,6 @@ def combined_loss_fcn(loss_components, weights):
     combined_loss = sum(w * lc for w, lc in zip(weights, loss_components))
     return combined_loss
 
-def _obj_function(u_opt, p_opt, theta, meta):
-    """
-    Example objective function computation.
-    Args:
-        u_opt: Optimal control inputs (B, nu, H)
-        p_opt: Optimal positions (B, 2, H)
-        x: Initial states (B, nx)
-        meta: Dictionary containing objective parameters
-    Returns:
-        Objective value tensor of shape (B,).
-    """
-    Wu, Wp, Wpt = 1.0, 1.0, 10.0
-
-    u_cost = torch.sum(u_opt ** 2, dim=(1, 2))
-    target_pos = theta[:, 4:]
-    tracking_target = target_pos.unsqueeze(-1).expand_as(p_opt[:, :, :-1])
-    tracking_cost = torch.sum((p_opt[:, :, :-1] - tracking_target) ** 2, dim=(1, 2))
-    terminal_cost = torch.sum((p_opt[:, :, -1] - target_pos) ** 2, dim=1)
-
-    objective_value = Wu * u_cost + Wp * tracking_cost + Wpt * terminal_cost
-    return objective_value
-
 class SSL_MIQP_incorporated:
 
     def __init__(self, nn_model, cvx_layer, nx, ny, device=None):
@@ -275,7 +253,7 @@ class SSL_MIQP_incorporated:
             
                         # Total loss with balanced weights
                         loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
-                        opt_obj_val = _obj_function(u_gt, pv_gt[:, :2, :], theta, meta=None).mean()
+                        opt_obj_val = obj_function(u_gt, pv_gt[:, :2, :], theta, meta=None).mean()
 
                         # Collect loss values
                         val_loss_total.append(loss.item())       
@@ -289,8 +267,9 @@ class SSL_MIQP_incorporated:
                         avg_val_loss = torch.mean(torch.tensor(val_loss_total))
                         avg_obj_val = torch.mean(torch.tensor(obj_val_total))
                         avg_opt_obj_val = torch.mean(torch.tensor(opt_obj_val_total))
+                        # Added a constant to make the opt gap not crazy
                         opt_gap = 100*(torch.tensor(obj_val_total) - 
-                            torch.tensor(opt_obj_val_total))/torch.tensor(opt_obj_val_total).abs()
+                            torch.tensor(opt_obj_val_total))/(1e2 + torch.tensor(opt_obj_val_total).abs())
                         avg_opt_gap = opt_gap.mean()
                         avg_slack_pen = torch.mean(torch.tensor(slack_pen_total))
                         avg_y_penalty = torch.mean(torch.tensor(y_penalty_total))
@@ -371,9 +350,8 @@ class SSL_MIQP_incorporated:
                 y_pred, u_opt, p_opt, s_opt, obj_val = self.forward(theta)
                 supervised_loss = supervised_loss_fn(y_pred, y_gt.float())
                 supervised_loss = supervised_loss.view(B, -1).mean(dim=1)
-                slack_pen = s_opt.sum(dim=1)
                 y_transposed = NNoutput_reshape_torch(y_pred, N_obs=3) # (B, 3, 4, H)
-                y_penalty = constraint_violation_torch(y_transposed, p_opt[:, :2, :])
+                slack_pen, y_penalty = constraint_violation_torch(y_transposed, p_opt[:, :2, :], evaluate=True)
                 violation_count, violation_fraction = constraint_violation_count_torch(y_transposed, p_opt[:, :2, :])
                 violation_percentage = violation_fraction * 100
 
@@ -382,13 +360,13 @@ class SSL_MIQP_incorporated:
                 
                 # Total loss with balanced weights
                 # loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
-                opt_obj_val = _obj_function(u_gt, pv_gt[:, :2, :], theta, meta=None)
+                opt_obj_val = obj_function(u_gt, pv_gt[:, :2, :], theta, meta=None)
 
                 obj_val_total.append(obj_val.detach().cpu())
                 opt_obj_val_total.append(opt_obj_val.detach().cpu())
                 slack_pen_total.append(slack_pen.detach().cpu())
                 constraint_violation_total.append(y_penalty.detach().cpu())
-                violation_count_total.append(violation_count.detach().cpu())
+                violation_count_total.append(violation_count.float().detach().cpu())
                 violation_percentage_total.append(violation_percentage.detach().cpu())
                 supervised_loss_total.append(supervised_loss.detach().cpu())
                 bit_accuracy_total.append(bit_accuracy.detach().cpu())
@@ -404,8 +382,8 @@ class SSL_MIQP_incorporated:
         violation_percentages = torch.cat(violation_percentage_total)
         supervised_losses = torch.cat(supervised_loss_total)
         bit_accuracies = torch.cat(bit_accuracy_total)
-
-        optimality_gap = 100 * (obj_vals - opt_obj_vals) / opt_obj_vals.abs().clamp_min(1e-8)
+        # Added a constant to make the opt gap not crazy
+        optimality_gap = 100 * (obj_vals - opt_obj_vals) / (1e2 + opt_obj_vals.abs())
 
         results = {
             "obj_val": obj_vals,
@@ -419,6 +397,14 @@ class SSL_MIQP_incorporated:
             "bit_accuracy": bit_accuracies,
             "optimality_gap": optimality_gap,
         }
+
+        print("=== Evaluation Summary ===")
+        for key, value in results.items():
+            if hasattr(value, "mean"):  # e.g. tensor or array
+                print(f"{key:20s}: mean = {value.mean():.4f}, std = {value.std():.4f}")
+            else:
+                print(f"{key:20s}: {value}")
+
 
         if save_path:
             save_dir = os.path.dirname(save_path)
@@ -459,7 +445,7 @@ class SSL_MIQP_incorporated:
         u_opt = u_opt.to(device)
         p_opt = p_opt.to(device)
 
-        obj_val = _obj_function(u_opt, p_opt, theta.to(device), meta=None)
+        obj_val = obj_function(u_opt, p_opt, theta.to(device), meta=None)
         # obj_val = obj_val + 1e4 * s_opt.sum(dim=1)  # include slack penalty per-sample
 
         return y_pred, u_opt, p_opt, s_opt, obj_val

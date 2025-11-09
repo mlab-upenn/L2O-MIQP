@@ -56,7 +56,7 @@ def main():
     # filenames, loss_weights, training_params = load_yaml_config("train_config.yaml")
     # This one is useful for running the script multiple times sequentially using .sh
     filenames, loss_weights, training_params = load_argparse_config()
-    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_loader, test_loader = prepare_data()
     cp_layer = build_dpc_cvxpy_layer(N = 20)
     nn_model = MLPWithSoftmaxSTE(
@@ -69,20 +69,11 @@ def main():
     Trainer_SSL = SSL_MIQPP_Trainer(
         nn_model=nn_model,
         cvx_layer=cp_layer,
-        device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    )
-    print("Loss weights: ", loss_weights)
-    Trainer_SSL.train_SSL(
-        train_loader=train_loader,
-        test_loader=test_loader,
-        training_params=training_params,
-        loss_weights=loss_weights,
-        loss_scale=10.0,
-        wandb_log=False
-    )
+        device=device)
 
+    Trainer_SSL.nn_model.load_state_dict(torch.load(filenames[1]))
+    Trainer_SSL.nn_model.to(device)
     Trainer_SSL.evaluate(test_loader, save_path = filenames[0])
-    torch.save(Trainer_SSL.nn_model.state_dict(), filenames[1])
 
     print("\033[31;42m FINISHED \033[0m")
 
