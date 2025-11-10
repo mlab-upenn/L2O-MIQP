@@ -34,7 +34,7 @@
 #     --save_stats \
 #     --filename robot_nav_hl_2 \
 #     --TRAINING_EPOCHS 20
-python test.py \
+python train.py \
     --w_obj 1e0 \
     --w_slack 1.0 \
     --w_con 1.0 \

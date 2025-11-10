@@ -11,7 +11,7 @@ from utils import *
 from Robots import *
 from Controller import *
 
-def save_data(data_list, shuffle = False):  
+def save_data(data_list, save_path, shuffle = False):  
     # post-processing + write out
     num_data = len(data_list)
     print("Auto-save with ", num_data, " data points")
@@ -22,21 +22,28 @@ def save_data(data_list, shuffle = False):
         shf_data_list = [data_list[i] for i in arr]
         data_list = shf_data_list
 
-    with open("single.p", "wb") as file:
+    save_dir = os.path.dirname(save_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+    with open(save_path, "wb") as file:
         pk.dump(data_list, file)
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n_sim", type=int, default=int(1e4))
+    parser.add_argument("--num_samples", type=int, default=int(1e4))
     parser.add_argument("--autosave", type=int, default=int(1e2))
     parser.add_argument("--shuffle", action="store_true", help="default: False")
+    parser.add_argument("--horizon", type=int, default=20, help="Planning horizon for the MIQP solver (default: 20)")
+    parser.add_argument("--save_path", type=str, default="data/single.p", help="Destination path for the saved dataset (default: data/single.p)")
     input_parser = parser.parse_args()
-    N_sim = input_parser.n_sim
+    N_sim = input_parser.num_samples
     autosave = input_parser.autosave
     shuffle = input_parser.shuffle
+    H = input_parser.horizon
+    save_path = input_parser.save_path
 
     # Define all the constants first
-    T = 0.25; H = 20
+    T = 0.25
     bounds = {
         "x_max": 2.00, "x_min": -0.5, 
         "y_max": 0.5, "y_min": -3.0,
@@ -119,10 +126,10 @@ def main():
                 break
 
         if (ss+1) % autosave == 0:
-            save_data(data_list, shuffle)
+            save_data(data_list, save_path, shuffle)
 
     # Save data at the end
-    save_data(data_list, shuffle)
+    save_data(data_list, save_path, shuffle)
 
 if __name__ == "__main__":
     main()

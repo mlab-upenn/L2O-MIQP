@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import pickle
 import os
+from pathlib import Path
 from src.neural_net import *
 from src.cfg_utils import *
 from trainer import *
@@ -97,6 +98,25 @@ def prepare_data(seed=42):
 
     return train_loader, test_loader, n_features, n_y, n_obs, Obs_info
 
+
+def prepare_output_paths(filenames, default_dir="checkpoints"):
+    """
+    Ensure model/stat files are stored under a default directory unless a custom
+    path (with its own parent directory) is provided. Also creates folders.
+    """
+    resolved = []
+    default_dir = Path(default_dir)
+    for name in filenames:
+        if name is None:
+            resolved.append(None)
+            continue
+        path = Path(name)
+        if path.parent == Path("."):
+            path = default_dir / path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        resolved.append(str(path))
+    return resolved
+
 def make_cplayer(weights=None, M=None, H=None, bounds=None, T=None, obstacles=None, coupling_pairs=None):
     T = 0.25 if T is None else T
     H = 20 if H is None else H
@@ -153,6 +173,7 @@ def main():
     # filename, loss_weights, training_params = load_yaml_config("train_config.yaml")
     # This one is useful for running the script multiple times sequentially using .sh
     filenames, loss_weights, training_params = load_argparse_config()
+    stats_path, model_path = prepare_output_paths(filenames)
 
     train_loader, test_loader, n_features, n_y, n_obs, Obs_info = prepare_data()
 
@@ -162,13 +183,13 @@ def main():
     n_input = 6
     n_output = 240
 
-    nn_model_1 = MLPWithSTE(insize=n_input, outsize=n_output,
+    nn_model = MLPWithSTE(insize=n_input, outsize=n_output,
                     bias=True,
                     linear_map=torch.nn.Linear,
                     nonlin=nn.ReLU,
                     hsizes=[128] * 4)
 
-    Model_SSL = SSL_MIQP_incorporated(nn_model_1, cplayer, 6, 4, device=device)
+    Model_SSL = SSL_MIQP_incorporated(nn_model, cplayer, 6, 4, device=device)
 
     Model_SSL.train_SSL(
         train_loader=train_loader, 
@@ -178,8 +199,9 @@ def main():
         loss_scale = 10.0,
         wandb_log = False)
     
-    _ = Model_SSL.evaluate(test_loader, save_path = filenames[0])
-    torch.save(Model_SSL.nn_model.state_dict(), filenames[1])
+    _ = Model_SSL.evaluate(test_loader, save_path = stats_path)
+    if model_path:
+        torch.save(Model_SSL.nn_model.state_dict(), model_path)
 
     print("\033[31;42m FINISHED \033[0m")
 

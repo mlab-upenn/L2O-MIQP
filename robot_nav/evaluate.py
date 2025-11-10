@@ -1,7 +1,9 @@
+import argparse
 import torch
 import numpy as np
 import pickle
 import os
+from pathlib import Path
 from src.neural_net import *
 from src.cfg_utils import *
 from trainer import *
@@ -97,6 +99,30 @@ def prepare_data(seed=42):
 
     return train_loader, test_loader, n_features, n_y, n_obs, Obs_info
 
+
+def resolve_paths(model_arg, stats_override=None, default_dir="checkpoints"):
+    """
+    Resolve model (.pth) and stats (.pt) paths based on the provided arguments.
+    Paths without directories are placed under `default_dir`, and stats files
+    automatically get a `stats_` prefix unless overridden.
+    """
+    model_path = Path(model_arg)
+    if model_path.suffix != ".pth":
+        model_path = model_path.with_suffix(".pth")
+    if model_path.parent == Path("."):
+        model_path = Path(default_dir) / model_path
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if stats_override:
+        stats_path = Path(stats_override)
+        if stats_path.suffix != ".pt":
+            stats_path = stats_path.with_suffix(".pt")
+    else:
+        stats_name = f"stats_{model_path.stem}"
+        stats_path = model_path.parent / f"{stats_name}.pt"
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+    return str(model_path), str(stats_path)
+
 def make_cplayer(weights=None, M=None, H=None, bounds=None, T=None, obstacles=None, coupling_pairs=None):
     T = 0.25 if T is None else T
     H = 20 if H is None else H
@@ -146,16 +172,16 @@ def make_cplayer(weights=None, M=None, H=None, bounds=None, T=None, obstacles=No
     return cplayer.to(torch.device("cpu")), meta
 
 def main():
-    # Create argument parser
-    parser = argparse.ArgumentParser(description="Evaluate a trained model")
-
-    # Define --filename argument
-    parser.add_argument("--filename", type=str, required=True, 
-        help="Path to the saved model file, no extension required"
+    parser = argparse.ArgumentParser(description="Evaluate a trained robot-navigation model.")
+    parser.add_argument(
+        "--model", required=True,
+        help="Path to the saved model checkpoint (.pth or base name)."
     )
-
+    parser.add_argument(
+        "--stats_out", default=None,
+        help="Optional output path for evaluation stats (.pt). Defaults to stats_<model>.pt."
+    )
     args = parser.parse_args()
-    filename = args.filename
 
     _, test_loader, _, _, _, _ = prepare_data()
 
@@ -172,9 +198,9 @@ def main():
                     hsizes=[128] * 4)
 
     Model_SSL = SSL_MIQP_incorporated(nn_model_1, cplayer, 6, 4, device=device)
-    # Load model from file
-    Model_SSL.nn_model.load_state_dict(torch.load(filename + ".pth"))    
-    Model_SSL.evaluate(test_loader, save_path = filename + ".pt")
+    model_path, stats_path = resolve_paths(args.model, args.stats_out)
+    Model_SSL.nn_model.load_state_dict(torch.load(model_path))
+    Model_SSL.evaluate(test_loader, save_path=stats_path)
 
     print("\033[31;42m FINISHED \033[0m")
 

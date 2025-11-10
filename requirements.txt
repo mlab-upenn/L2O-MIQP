@@ -8,3 +8,5 @@ gurobipy
 ipykernel
 scipy
 wandb
+pathlib
+tqdm

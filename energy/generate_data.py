@@ -2,6 +2,8 @@
 # Silent MIQP dataset generator with fixed problem params.
 # X = [x0, d_seq], Y = delta trajectory, Z = {u_trj, x_trj, obj}
 from __future__ import annotations
+import argparse
+from pathlib import Path
 import numpy as np
 import gurobipy as gp
 from gurobipy import GRB
@@ -308,16 +310,43 @@ def build_dataset(
     return {"X": X, "Y": Y, "Z": {"U": U, "Xtraj": Xtraj, "OBJ": OBJ}, "STATUS": STAT, "RELAX": RELAX}
 
 
-# ---------------- Example (kept silent) ----------------
+# ---------------- CLI entry point ----------------
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate MIQP datasets for the thermal energy tank system."
+    )
+    parser.add_argument(
+        "--num_samples", type=int, default=int(1e5),
+        help="Number of problem instances to solve (default: 100000)."
+    )
+    parser.add_argument(
+        "--horizon", type=int, default=20,
+        help="Prediction horizon N used in the MIQP (default: 20)."
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed for reproducibility."
+    )
+    parser.add_argument(
+        "--save_path", type=str, default="data/data.npz",
+        help="Output path for the compressed dataset (default: data/data.npz)."
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    # Build a small silent dataset (no prints)
-    data = build_dataset(
-        num_samples=int(1e5),
-        N=20,
-        seed=114514,
-        c_x=None, c_u=None,         # None/None -> hard bounds
-        time_limit=None,            # e.g., 5.0
-        y_one_hot=False,            # True -> (S,N,4)
-        save_npz="data/data.npz",
+    args = parse_args()
+    save_path = Path(args.save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    build_dataset(
+        num_samples=args.num_samples,
+        N=args.horizon,
+        seed=args.seed,
+        c_x=C_X,
+        c_u=C_U,
+        time_limit=None,
+        y_one_hot=False,
+        save_npz=str(save_path),
         return_torch=False,
     )

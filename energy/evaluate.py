@@ -1,14 +1,13 @@
+import argparse
 import numpy as np
 import torch 
-import datetime
 import os
-import yaml
+from pathlib import Path
 from sklearn.model_selection import train_test_split
 
 from src.neural_net import *
 from cvxpy_dpc_layer import *
 from trainer import *
-from src.cfg_utils import *
 
 def prepare_data():
     relative_path = os.getcwd()
@@ -48,14 +47,43 @@ def prepare_data():
     )
     return train_loader, test_loader
 
+
+def resolve_paths(model_arg, stats_override=None, default_dir="checkpoints"):
+    """
+    Resolve model (.pth) and stats (.pt) paths based on user-provided arguments.
+    Paths without a directory are placed inside `default_dir`, and stats files
+    get a `stats_` prefix unless explicitly overridden.
+    """
+    model_path = Path(model_arg)
+    if model_path.suffix != ".pth":
+        model_path = model_path.with_suffix(".pth")
+    if model_path.parent == Path("."):
+        model_path = Path(default_dir) / model_path
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if stats_override:
+        stats_path = Path(stats_override)
+        if stats_path.suffix != ".pt":
+            stats_path = stats_path.with_suffix(".pt")
+    else:
+        stats_name = f"stats_{model_path.stem}"
+        stats_path = model_path.parent / f"{stats_name}.pt"
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+    return str(model_path), str(stats_path)
+
 def main():
-    # ---------------------------------------------- #
-    # Either of the following ways to load config
-    # ---------------------------------------------- #
-    # This one is useful for running the script once
-    # filenames, loss_weights, training_params = load_yaml_config("train_config.yaml")
-    # This one is useful for running the script multiple times sequentially using .sh
-    filenames, loss_weights, training_params = load_argparse_config()
+    parser = argparse.ArgumentParser(description="Evaluate a trained energy-system model.")
+    parser.add_argument(
+        "--model", required=True,
+        help="Path to the saved model checkpoint (.pth or base name)."
+    )
+    parser.add_argument(
+        "--stats_out", default=None,
+        help="Optional path for evaluation stats (.pt). Defaults to stats_<model>.pt."
+    )
+    args = parser.parse_args()
+
+    model_path, stats_path = resolve_paths(args.model, args.stats_out)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_loader, test_loader = prepare_data()
     cp_layer = build_dpc_cvxpy_layer(N = 20)
@@ -71,9 +99,9 @@ def main():
         cvx_layer=cp_layer,
         device=device)
 
-    Trainer_SSL.nn_model.load_state_dict(torch.load(filenames[1]))
+    Trainer_SSL.nn_model.load_state_dict(torch.load(model_path))
     Trainer_SSL.nn_model.to(device)
-    Trainer_SSL.evaluate(test_loader, save_path = filenames[0])
+    Trainer_SSL.evaluate(test_loader, save_path = stats_path)
 
     print("\033[31;42m FINISHED \033[0m")
 

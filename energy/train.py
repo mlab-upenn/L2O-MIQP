@@ -3,6 +3,7 @@ import torch
 import datetime
 import os
 import yaml
+from pathlib import Path
 from sklearn.model_selection import train_test_split
 
 from src.neural_net import *
@@ -48,6 +49,26 @@ def prepare_data():
     )
     return train_loader, test_loader
 
+
+def prepare_output_paths(filenames, default_dir="checkpoints"):
+    """
+    Place stats/model files under a default checkpoints directory unless the user
+    provides an explicit path. Creates directories as needed.
+    """
+    resolved = []
+    default_dir = Path(default_dir)
+    default_dir.mkdir(parents=True, exist_ok=True)
+    for name in filenames:
+        if name is None:
+            resolved.append(None)
+            continue
+        path = Path(name)
+        if path.parent == Path("."):
+            path = default_dir / path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        resolved.append(str(path))
+    return resolved
+
 def main():
     # ---------------------------------------------- #
     # Either of the following ways to load config
@@ -56,6 +77,7 @@ def main():
     # filenames, loss_weights, training_params = load_yaml_config("train_config.yaml")
     # This one is useful for running the script multiple times sequentially using .sh
     filenames, loss_weights, training_params = load_argparse_config()
+    stats_path, model_path = prepare_output_paths(filenames)
     
     train_loader, test_loader = prepare_data()
     cp_layer = build_dpc_cvxpy_layer(N = 20)
@@ -81,8 +103,9 @@ def main():
         wandb_log=False
     )
 
-    Trainer_SSL.evaluate(test_loader, save_path = filenames[0])
-    torch.save(Trainer_SSL.nn_model.state_dict(), filenames[1])
+    Trainer_SSL.evaluate(test_loader, save_path = stats_path)
+    if model_path:
+        torch.save(Trainer_SSL.nn_model.state_dict(), model_path)
 
     print("\033[31;42m FINISHED \033[0m")
 

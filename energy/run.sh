@@ -1,6 +1,6 @@
 #!/bin/bash
 # supervised learning
-python test.py \
+python train.py \
     --w_obj 0.0 \
     --w_slack 0.0 \
     --w_con 0.0 \
@@ -9,7 +9,7 @@ python test.py \
     --filename energy_tank_sl \
     --TRAINING_EPOCHS 20
 # self-supervised learning
-python test.py \
+python train.py \
     --w_obj 1e-3 \
     --w_slack 1.0 \
     --w_con 1.0 \
@@ -18,7 +18,7 @@ python test.py \
     --filename energy_tank_ssl \
     --TRAINING_EPOCHS 20 \
 # hybrid learning
-python test.py \
+python train.py \
     --w_obj 0.0 \
     --w_slack 1.0 \
     --w_con 1.0 \
@@ -26,7 +26,7 @@ python test.py \
     --save_stats \
     --filename energy_tank_hl_1 \
     --TRAINING_EPOCHS 20    
-python test.py \
+python train.py \
     --w_obj 0.0 \
     --w_slack 0.0 \
     --w_con 1.0 \
