@@ -146,15 +146,18 @@ def make_cplayer(weights=None, M=None, H=None, bounds=None, T=None, obstacles=No
     return cplayer.to(torch.device("cpu")), meta
 
 def main():
-    # ---------------------------------------------- #
-    # Either of the following ways to load config
-    # ---------------------------------------------- #
-    # This one is useful for running the script once
-    # filename, loss_weights, training_params = load_yaml_config("train_config.yaml")
-    # This one is useful for running the script multiple times sequentially using .sh
-    filenames, loss_weights, training_params = load_argparse_config()
+    # Create argument parser
+    parser = argparse.ArgumentParser(description="Evaluate a trained model")
 
-    train_loader, test_loader, n_features, n_y, n_obs, Obs_info = prepare_data()
+    # Define --filename argument
+    parser.add_argument("--filename", type=str, required=True, 
+        help="Path to the saved model file, no extension required"
+    )
+
+    args = parser.parse_args()
+    filename = args.filename
+
+    _, test_loader, _, _, _, _ = prepare_data()
 
     cplayer, meta = make_cplayer()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -170,8 +173,8 @@ def main():
 
     Model_SSL = SSL_MIQP_incorporated(nn_model_1, cplayer, 6, 4, device=device)
     # Load model from file
-    Model_SSL.nn_model.load_state_dict(torch.load(filenames[1]))    
-    Model_SSL.evaluate(test_loader, save_path = filenames[0])
+    Model_SSL.nn_model.load_state_dict(torch.load(filename + ".pth"))    
+    Model_SSL.evaluate(test_loader, save_path = filename + ".pt")
 
     print("\033[31;42m FINISHED \033[0m")
 
