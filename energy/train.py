@@ -7,9 +7,9 @@ from pathlib import Path
 from sklearn.model_selection import train_test_split
 
 from src.neural_net import *
-from cvxpy_dpc_layer import *
-from trainer import *
+from src.trainer import MIQP_Trainer
 from src.cfg_utils import *
+from miqp import MIQP
 
 def prepare_data():
     relative_path = os.getcwd()
@@ -80,7 +80,7 @@ def main():
     stats_path, model_path = prepare_output_paths(filenames)
     
     train_loader, test_loader = prepare_data()
-    cp_layer = build_dpc_cvxpy_layer(N = 20)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     nn_model = MLPWithSoftmaxSTE(
         insize=42,
         outsize=20,
@@ -88,11 +88,8 @@ def main():
         hsizes=[128] * 4
     )
 
-    Trainer_SSL = SSL_MIQPP_Trainer(
-        nn_model=nn_model,
-        cvx_layer=cp_layer,
-        device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    )
+    energy_miqp = MIQP(nn_model=nn_model, device=device, horizon=20)
+    Trainer_SSL = MIQP_Trainer(energy_miqp)
     print("Loss weights: ", loss_weights)
     Trainer_SSL.train_SSL(
         train_loader=train_loader,

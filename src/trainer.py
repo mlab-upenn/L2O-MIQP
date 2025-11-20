@@ -1,12 +1,7 @@
-
 import os
 import torch
 import torch.nn as nn
-import numpy as np
-import cvxpy as cp
 import wandb
-import random
-from cons_utils import *
 
 # Define some penalty functions that we may use
 l1_penalty = lambda s: s.sum(dim=1)
@@ -20,28 +15,25 @@ def combined_loss_fcn(loss_components, weights):
     combined_loss = sum(w * lc for w, lc in zip(weights, loss_components))
     return combined_loss
 
-class SSL_MIQP_incorporated:
+class MIQP_Trainer:
 
-    def __init__(self, nn_model, cvx_layer, nx, ny, device=None):
+    def __init__(self, miqp_solver):
         """
-        Initialize the SSL_MIQP model.
+        Initialize the trainer with a user-provided MIQP solver wrapper.
         Args:
-            nn_model: The neural network model.
-            cvx_layer: The CVXPY layer for optimization.
-            nx: Number of input features.
-            ny: Number of output features.
-            device: The device (CPU or GPU).    
+            miqp_solver: Object exposing nn_model/device plus solve/eval helpers.
         """
-        self.nn_model = nn_model
-        self.cvx_layer = cvx_layer
-        self.nx, self.ny = nx, ny
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if miqp_solver is None:
+            raise ValueError("miqp_solver must be provided")
+        self.miqp_solver = miqp_solver
+        self.nn_model = self.miqp_solver.nn_model
+        self.device = self.miqp_solver.device
+        self.num_obstacles = getattr(self.miqp_solver, "num_obstacles", None)
 
     def train_SL(self, train_loader, test_loader, training_params, wandb_log = False):
         """
-        Train the neural network model using supervised learning.
+        Train the neural network model purely using supervised learning.
         Args:
-            ground_truth_solver: Function to get ground truth solutions.
             train_loader: DataLoader for training data.
             test_loader: DataLoader for testing data.
             training_params: Dictionary containing training parameters.
@@ -73,14 +65,13 @@ class SSL_MIQP_incorporated:
 
         for epoch in range(1, TRAINING_EPOCHS+1):
             self.nn_model.train()
-            for theta_batch, y_gt_batch, _, _ in train_loader:
-                theta_batch = theta_batch.to(device)
-                y_gt_batch = y_gt_batch.to(device)
-                
-                # B = theta_batch.shape[0] # batch size
+            for theta, y_gt, _, _ in train_loader:
+                theta = theta.to(device)
+                y_gt = y_gt.to(device)
+
                 # ---- Predict y from theta ----
-                y_pred = self.nn_model(theta_batch).float() # (B, ny), hard {0,1}
-                supervised_loss = supervised_loss_fn(y_pred, y_gt_batch.float())
+                y_pred = self.miqp_solver.predict_y(theta)
+                supervised_loss = supervised_loss_fn(y_pred, y_gt.float())
                 loss = supervised_loss
                 if wandb_log: wandb.log({
                     "train/loss": loss.item(),
@@ -89,7 +80,7 @@ class SSL_MIQP_incorporated:
                 # ---- Backprop ----
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.nn_model.parameters(), max_norm=1e1)
+                # torch.nn.utils.clip_grad_norm_(self.nn_model.parameters(), max_norm=1e1)
                 optimizer.step()
                 global_step += 1
                 
@@ -99,12 +90,12 @@ class SSL_MIQP_incorporated:
                     val_loss_total = 0.0
                     self.nn_model.eval()
                     with torch.no_grad():
-                        for val_theta_batch, val_y_gt_batch, _, _ in test_loader:
-                            val_theta_batch = val_theta_batch.to(device)
-                            val_y_gt_batch = val_y_gt_batch.to(device)
+                        for theta, y_gt, _, _ in test_loader:
+                            theta = theta.to(device)
+                            y_gt = y_gt.to(device)
                             # ---- Predict y from theta ----
-                            y_pred_test = self.nn_model(val_theta_batch).float() # (B, ny), hard {0,1}
-                            val_loss_total += supervised_loss_fn(y_pred_test, val_y_gt_batch.float()).item()                           
+                            y_pred_test = self.miqp_solver.predict_y(theta)
+                            val_loss_total += supervised_loss_fn(y_pred_test, y_gt.float()).item()                           
                         avg_val_loss = val_loss_total / len(test_loader)
 
                     print(f"[epoch {epoch} | step {global_step}] "
@@ -123,17 +114,17 @@ class SSL_MIQP_incorporated:
                         print(f"Learning rate updated: {last_lr:.6f} -> {current_lr:.6f}")
                         last_lr = current_lr
 
-                    # if avg_val_loss < best_val_loss:
-                    #     best_val_loss = avg_val_loss
-                    #     epochs_no_improve = 0
-                    # else:
-                    #     epochs_no_improve += 1
-                    #     if epochs_no_improve >= PATIENCE:
-                    #         print("Early stopping triggered!")
-                    #         return
-
+                    if avg_val_loss < best_val_loss:
+                        best_val_loss = avg_val_loss
+                        epochs_no_improve = 0
+                    else:
+                        epochs_no_improve += 1
+                        if epochs_no_improve >= PATIENCE:
+                            print("Early stopping triggered!")
+                            return
+                        
         if wandb_log: wandb.finish()
-                    
+
     def train_SSL(self, train_loader, test_loader, training_params, loss_weights, 
             loss_scale = 1.0, wandb_log = False):
         """
@@ -144,6 +135,7 @@ class SSL_MIQP_incorporated:
             test_loader: DataLoader for testing data.
             training_params: Dictionary containing training parameters.
             loss_weights: List of weights for different loss components.
+            loss_scale: a factor to scale the loss 
             obj_fcn: Function to compute objective value given (x, y).
             y_cons: List of functions to compute constraint violations only on y (integer variables).
             slack_penalty: Function to compute penalty on slack variables.
@@ -160,7 +152,6 @@ class SSL_MIQP_incorporated:
         # Put all layers in device
         device = self.device
         self.nn_model.to(device)
-        # self.cvx_layer.to(device)
 
         # Define weights for loss components
         weights = torch.tensor(loss_weights, device=device)
@@ -184,23 +175,22 @@ class SSL_MIQP_incorporated:
         torch.autograd.set_detect_anomaly(True)
         for epoch in range(1, TRAINING_EPOCHS+1):
             self.nn_model.train()
-            for theta, y_gt, _, _ in train_loader:
+            for theta, y_gt, x_gt, u_gt in train_loader:
                 theta = theta.to(device)
                 y_gt = y_gt.to(device)
-                
-                # warped forward pass
-                y_pred, u_opt, p_opt, s_opt, obj_val = self.forward(theta)
-
-                obj_val = obj_val.mean()
-
-                # Supervised loss from dataset
-                supervised_loss = supervised_loss_fn(y_pred, y_gt.float())
-                slack_pen = s_opt.sum(dim=1).mean()
-                y_transposed = NNoutput_reshape_torch(y_pred, N_obs=3) # (B, 3, 4, H)
-                y_penalty = constraint_violation_torch(y_transposed, p_opt[:, :2, :]).mean()
-                
+                x_gt = x_gt.to(device)
+                u_gt = u_gt.to(device)
+                # MIQP-guided forward pass + metrics
+                sol_qp, y_pred, _ = self.miqp_solver.solve_miqp(theta)
+                (
+                    obj_val,
+                    supervised_loss,
+                    slack_pen,
+                    y_penalty,
+                ) = self.miqp_solver.eval_solution_train(
+                    theta, sol_qp, y_pred, (y_gt, x_gt, u_gt), supervised_loss_fn
+                )
                 # Total loss with balanced weights
-                # loss = supervised_loss
                 loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
                 if wandb_log: wandb.log({
                     "train/combined_loss": loss.item(),
@@ -220,7 +210,7 @@ class SSL_MIQP_incorporated:
                 # ---- Backprop ----
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.nn_model.parameters(), max_norm=1e1)
+                # torch.nn.utils.clip_grad_norm_(self.nn_model.parameters(), max_norm=1e1)
                 optimizer.step()         
                 global_step += 1
 
@@ -230,30 +220,31 @@ class SSL_MIQP_incorporated:
                     val_loss_total = []; obj_val_total = []; opt_obj_val_total = []
                     slack_pen_total = []; y_penalty_total = []
                     supervised_loss_total = []
-
                 
                     with torch.no_grad():
                         # for theta, y_gt, pv_gt, u_gt in test_loader:
-                        theta, y_gt, pv_gt, u_gt = next(iter(test_loader))                     
+                        theta, y_gt, x_gt, u_gt = next(iter(test_loader))                     
                         theta = theta.to(device)
                         y_gt = y_gt.to(device)
-                        pv_gt = pv_gt.to(device)
+                        x_gt = x_gt.to(device)
                         u_gt = u_gt.to(device)
 
-                        # ---- Predict y from theta ----
-                        y_pred, u_opt, p_opt, s_opt, obj_val = self.forward(theta)    
-                        obj_val = obj_val.mean()
-
-                        supervised_loss = supervised_loss_fn(y_pred, y_gt.float())
-
-                        # Slack penalty included inside cvx_layer.solve
-                        slack_pen = s_opt.sum(dim=1).mean()
-                        y_transposed = NNoutput_reshape_torch(y_pred, N_obs=3) # (B, 3, 4, H)
-                        y_penalty = constraint_violation_torch(y_transposed, p_opt[:, :2, :]).mean()
+                        # ---- Predict y/trajectory from theta ----
+                        sol_qp, y_pred, _ = self.miqp_solver.solve_miqp(theta)
+                        (
+                            obj_val,
+                            supervised_loss,
+                            slack_pen,
+                            y_penalty,
+                            opt_obj_val,
+                            violation_total,
+                            violation_percent,
+                        ) = self.miqp_solver.eval_solution_test(
+                            theta, sol_qp, y_pred, (y_gt, x_gt, u_gt), supervised_loss_fn
+                        )
             
                         # Total loss with balanced weights
                         loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
-                        opt_obj_val = obj_function(u_gt, pv_gt[:, :2, :], theta, meta=None).mean()
 
                         # Collect loss values
                         val_loss_total.append(loss.item())       
@@ -266,10 +257,8 @@ class SSL_MIQP_incorporated:
                         # Compute the averages
                         avg_val_loss = torch.mean(torch.tensor(val_loss_total))
                         avg_obj_val = torch.mean(torch.tensor(obj_val_total))
-                        avg_opt_obj_val = torch.mean(torch.tensor(opt_obj_val_total))
-                        # Added a constant to make the opt gap not crazy
                         opt_gap = 100*(torch.tensor(obj_val_total) - 
-                            torch.tensor(opt_obj_val_total))/(1e2 + torch.tensor(opt_obj_val_total).abs())
+                            torch.tensor(opt_obj_val_total))/torch.tensor(opt_obj_val_total).abs()
                         avg_opt_gap = opt_gap.mean()
                         avg_slack_pen = torch.mean(torch.tensor(slack_pen_total))
                         avg_y_penalty = torch.mean(torch.tensor(y_penalty_total))
@@ -314,9 +303,9 @@ class SSL_MIQP_incorporated:
                     #     return
 
         if wandb_log and started_wandb_run: 
-            wandb.finish()          
+            wandb.finish() 
 
-    def evaluate(self, data_loader, ground_truth_solver = None, save_path = "eval_results.pt"):
+    def evaluate(self, data_loader, ground_truth_solver = None, save_path="energy/eval_results.pt"):
         """
         Evaluate the neural network model on given data.
         Args:
@@ -328,47 +317,42 @@ class SSL_MIQP_incorporated:
         device = self.device
         self.nn_model.to(device)
         self.nn_model.eval()
-        supervised_loss_fn = nn.HuberLoss(reduction='none') 
+        supervised_loss_fn = nn.HuberLoss() 
 
         obj_val_total = []
         opt_obj_val_total = []
         slack_pen_total = []
-        constraint_violation_total = []
-        violation_count_total = []
-        violation_percentage_total = []
+        y_pen_total = []
         supervised_loss_total = []
         bit_accuracy_total = []
 
         with torch.no_grad():
-            for theta, y_gt, pv_gt, u_gt in data_loader:
+            for theta, y_gt, x_gt, u_gt in data_loader:
                 theta = theta.to(device)
                 y_gt = y_gt.to(device)
-                pv_gt = pv_gt.to(device)
+                x_gt = x_gt.to(device)
                 u_gt = u_gt.to(device)
-                B = theta.shape[0]
 
-                y_pred, u_opt, p_opt, s_opt, obj_val = self.forward(theta)
-                supervised_loss = supervised_loss_fn(y_pred, y_gt.float())
-                supervised_loss = supervised_loss.view(B, -1).mean(dim=1)
-                y_transposed = NNoutput_reshape_torch(y_pred, N_obs=3) # (B, 3, 4, H)
-                slack_pen, y_penalty = constraint_violation_torch(y_transposed, p_opt[:, :2, :], evaluate=True)
-                violation_count, violation_fraction = constraint_violation_count_torch(y_transposed, p_opt[:, :2, :])
-                violation_percentage = violation_fraction * 100
+                sol_qp, y_pred, _ = self.miqp_solver.solve_miqp(theta)
+                (
+                    obj_val,
+                    supervised_loss,
+                    slack_pen,
+                    y_penalty,
+                    opt_obj_val,
+                    violation_total,
+                    violation_percent,
+                ) = self.miqp_solver.eval_solution_test(
+                    theta, sol_qp, y_pred, (y_gt, x_gt, u_gt), supervised_loss_fn
+                )
+                pred_labels = torch.round(y_pred).long()
+                bit_accuracy = (pred_labels == y_gt.long()).float().view(theta.size(0), -1).mean(dim=1)
 
-                binary_pred = (y_pred >= 0.5).float()
-                bit_accuracy = (binary_pred == y_gt.float()).float().view(B, -1).mean(dim=1)
-                
-                # Total loss with balanced weights
-                # loss = combined_loss_fcn([obj_val, slack_pen, y_penalty, supervised_loss], weights)
-                opt_obj_val = obj_function(u_gt, pv_gt[:, :2, :], theta, meta=None)
-
-                obj_val_total.append(obj_val.detach().cpu())
-                opt_obj_val_total.append(opt_obj_val.detach().cpu())
-                slack_pen_total.append(slack_pen.detach().cpu())
-                constraint_violation_total.append(y_penalty.detach().cpu())
-                violation_count_total.append(violation_count.float().detach().cpu())
-                violation_percentage_total.append(violation_percentage.detach().cpu())
-                supervised_loss_total.append(supervised_loss.detach().cpu())
+                obj_val_total.append(obj_val.detach().cpu().unsqueeze(0))
+                opt_obj_val_total.append(opt_obj_val.detach().cpu().unsqueeze(0))
+                slack_pen_total.append(slack_pen.detach().cpu().unsqueeze(0))
+                y_pen_total.append(y_penalty.detach().cpu().unsqueeze(0))
+                supervised_loss_total.append(supervised_loss.detach().cpu().unsqueeze(0))
                 bit_accuracy_total.append(bit_accuracy.detach().cpu())
 
         if not obj_val_total:
@@ -377,34 +361,29 @@ class SSL_MIQP_incorporated:
         obj_vals = torch.cat(obj_val_total)
         opt_obj_vals = torch.cat(opt_obj_val_total)
         slack_penalties = torch.cat(slack_pen_total)
-        y_penalties = torch.cat(constraint_violation_total)
-        violation_counts = torch.cat(violation_count_total)
-        violation_percentages = torch.cat(violation_percentage_total)
+        y_penalties = torch.cat(y_pen_total)
         supervised_losses = torch.cat(supervised_loss_total)
         bit_accuracies = torch.cat(bit_accuracy_total)
         # Added a constant to make the opt gap not crazy
         optimality_gap = 100 * (obj_vals - opt_obj_vals) / (1e2 + opt_obj_vals.abs())
-
         results = {
             "obj_val": obj_vals,
             "opt_obj_val": opt_obj_vals,
+            "optimality_gap": optimality_gap,
             "slack_penalty": slack_penalties,
             "y_penalty": y_penalties,
-            "constraint_violation_magnitude": y_penalties,
-            "constraint_violation_count": violation_counts,
-            "constraint_violation_percentage": violation_percentages,
             "supervised_loss": supervised_losses,
             "bit_accuracy": bit_accuracies,
-            "optimality_gap": optimality_gap,
         }
 
         print("=== Evaluation Summary ===")
         for key, value in results.items():
             if hasattr(value, "mean"):  # e.g. tensor or array
-                print(f"{key:20s}: mean = {value.mean():.4f}, std = {value.std():.4f}")
+                # use population std to avoid NaN when only one sample
+                std_val = value.std(unbiased=False)
+                print(f"{key:20s}: mean = {value.mean():.4f}, std = {std_val:.4f}")
             else:
                 print(f"{key:20s}: {value}")
-
 
         if save_path:
             save_dir = os.path.dirname(save_path)
@@ -412,41 +391,7 @@ class SSL_MIQP_incorporated:
                 os.makedirs(save_dir, exist_ok=True)
             torch.save(results, save_path)
             print(f"Saved evaluation results to {save_path}")
+        else:
+            print("No save path provided; skipping serialization.")
 
         return results
-
-    def forward(self, theta):
-        """
-        Forward pass through the neural network model and CVXPY layer.
-        Args:
-            theta: Input tensor of problem parameters.
-        Returns:
-            y_pred: Predicted integer variables from the neural network.
-            p_opt: Optimal positions from the CVXPY layer.
-            u_opt: Optimal control inputs from the CVXPY layer.
-            s_opt: Slack variables from the CVXPY layer.
-            obj_val: Objective value computed using the optimal solutions.
-        """
-        device = self.device
-
-        theta = theta.to(device)
-        y_pred = self.nn_model(theta).float()
-
-        theta = theta.cpu()
-        y_pred = y_pred.cpu()
-
-        u_opt, p_opt, _, s_opt = self.cvx_layer( theta[:, 0:2], 
-                                             theta[:, 2:4], 
-                                             theta[:, 4:6], 
-                                             y_pred.reshape(-1, 3, 1, 20, 4))
-
-        theta = theta.to(device)
-        y_pred = y_pred.to(device)
-        u_opt = u_opt.to(device)
-        p_opt = p_opt.to(device)
-
-        obj_val = obj_function(u_opt, p_opt, theta.to(device), meta=None)
-        # obj_val = obj_val + 1e4 * s_opt.sum(dim=1)  # include slack penalty per-sample
-
-        return y_pred, u_opt, p_opt, s_opt, obj_val
-

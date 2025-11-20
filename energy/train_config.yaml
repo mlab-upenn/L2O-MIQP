@@ -5,7 +5,7 @@ weights:
   w_sup: 1e0
 
 training:
-  TRAINING_EPOCHS: 0
+  TRAINING_EPOCHS: 1
   CHECKPOINT_AFTER: 50
   LEARNING_RATE: 1e-3
   WEIGHT_DECAY: 1e-5

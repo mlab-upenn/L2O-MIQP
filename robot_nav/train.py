@@ -2,12 +2,17 @@ import torch
 import numpy as np
 import pickle
 import os
+import sys
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
+
 from src.neural_net import *
 from src.cfg_utils import *
-from trainer import *
-from cvxpy_mpc_layer import *
-from Robots import obstacle
+from src.trainer import MIQP_Trainer
+from robot_nav.miqp import MIQP
 
 def prepare_data(seed=42):
     relative_path = os.getcwd()
@@ -117,54 +122,6 @@ def prepare_output_paths(filenames, default_dir="checkpoints"):
         resolved.append(str(path))
     return resolved
 
-def make_cplayer(weights=None, M=None, H=None, bounds=None, T=None, obstacles=None, coupling_pairs=None):
-    T = 0.25 if T is None else T
-    H = 20 if H is None else H
-    M = 1 if M is None else M
-    bounds = {
-        "x_max": 2.00,
-        "x_min": -0.5,
-        "y_max": 0.5,
-        "y_min": -3.0,
-        "v_max": 0.50,
-        "v_min": -0.50,
-        "u_max": 0.50,
-        "u_min": -0.50,
-    } if bounds is None else bounds
-    weights = (1.0, 1.0, 10.0) if weights is None else weights  # (Wu, Wp, Wpt)
-    d_min = 0.25
-
-    # Obstacles exactly as in the simulator
-    
-    obstacles = [
-        obstacle(1.0, 0.0, 0.4, 0.5, 0.0),
-        obstacle(0.7, -1.1, 0.5, 0.4, 0.0),
-        obstacle(0.40, -2.50, 0.4, 0.5, 0.0),
-    ]
-
-    M = 1
-    p = np.zeros((2, M))  # stack of robot positions; replace with actual state
-    d_prox = 2.0
-    coupling_pairs = [
-        (m, n)
-        for m in range(M)
-        for n in range(m + 1, M)
-        if np.linalg.norm(p[:, m] - p[:, n]) <= d_prox
-    ]
-
-    cplayer, meta = build_mpc_cvxpy_layer(
-            T=.25,
-            H=20,
-            M=1,
-            bounds=bounds,
-            weights=weights,
-            d_min=d_min,
-            obstacles=obstacles,
-            coupling_pairs=coupling_pairs
-        )
-
-    return cplayer.to(torch.device("cpu")), meta
-
 def main():
     # ---------------------------------------------- #
     # Either of the following ways to load config
@@ -172,12 +129,12 @@ def main():
     # This one is useful for running the script once
     # filename, loss_weights, training_params = load_yaml_config("train_config.yaml")
     # This one is useful for running the script multiple times sequentially using .sh
-    filenames, loss_weights, training_params = load_argparse_config()
+    default_cfg = Path(__file__).with_name("train_config.yaml")
+    filenames, loss_weights, training_params = load_yaml_config(str(default_cfg))
     stats_path, model_path = prepare_output_paths(filenames)
 
     train_loader, test_loader, n_features, n_y, n_obs, Obs_info = prepare_data()
 
-    cplayer, meta = make_cplayer()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     n_input = 6
@@ -189,7 +146,8 @@ def main():
                     nonlin=nn.ReLU,
                     hsizes=[128] * 4)
 
-    Model_SSL = SSL_MIQP_incorporated(nn_model, cplayer, 6, 4, device=device)
+    robot_miqp = MIQP(nn_model=nn_model, device=device)
+    Model_SSL = MIQP_Trainer(robot_miqp)
 
     Model_SSL.train_SSL(
         train_loader=train_loader, 

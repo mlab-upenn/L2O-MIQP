@@ -4,11 +4,11 @@ import numpy as np
 import pickle
 import os
 from pathlib import Path
+
 from src.neural_net import *
 from src.cfg_utils import *
-from trainer import *
-from cvxpy_mpc_layer import *
-from Robots import obstacle
+from src.trainer import MIQP_Trainer
+from robot_nav.miqp import MIQP
 
 def prepare_data(seed=42):
     relative_path = os.getcwd()
@@ -123,54 +123,6 @@ def resolve_paths(model_arg, stats_override=None, default_dir="checkpoints"):
     stats_path.parent.mkdir(parents=True, exist_ok=True)
     return str(model_path), str(stats_path)
 
-def make_cplayer(weights=None, M=None, H=None, bounds=None, T=None, obstacles=None, coupling_pairs=None):
-    T = 0.25 if T is None else T
-    H = 20 if H is None else H
-    M = 1 if M is None else M
-    bounds = {
-        "x_max": 2.00,
-        "x_min": -0.5,
-        "y_max": 0.5,
-        "y_min": -3.0,
-        "v_max": 0.50,
-        "v_min": -0.50,
-        "u_max": 0.50,
-        "u_min": -0.50,
-    } if bounds is None else bounds
-    weights = (1.0, 1.0, 10.0) if weights is None else weights  # (Wu, Wp, Wpt)
-    d_min = 0.25
-
-    # Obstacles exactly as in the simulator
-    
-    obstacles = [
-        obstacle(1.0, 0.0, 0.4, 0.5, 0.0),
-        obstacle(0.7, -1.1, 0.5, 0.4, 0.0),
-        obstacle(0.40, -2.50, 0.4, 0.5, 0.0),
-    ]
-
-    M = 1
-    p = np.zeros((2, M))  # stack of robot positions; replace with actual state
-    d_prox = 2.0
-    coupling_pairs = [
-        (m, n)
-        for m in range(M)
-        for n in range(m + 1, M)
-        if np.linalg.norm(p[:, m] - p[:, n]) <= d_prox
-    ]
-
-    cplayer, meta = build_mpc_cvxpy_layer(
-            T=.25,
-            H=20,
-            M=1,
-            bounds=bounds,
-            weights=weights,
-            d_min=d_min,
-            obstacles=obstacles,
-            coupling_pairs=coupling_pairs
-        )
-
-    return cplayer.to(torch.device("cpu")), meta
-
 def main():
     parser = argparse.ArgumentParser(description="Evaluate a trained robot-navigation model.")
     parser.add_argument(
@@ -185,7 +137,6 @@ def main():
 
     _, test_loader, _, _, _, _ = prepare_data()
 
-    cplayer, meta = make_cplayer()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     n_input = 6
@@ -197,7 +148,8 @@ def main():
                     nonlin=nn.ReLU,
                     hsizes=[128] * 4)
 
-    Model_SSL = SSL_MIQP_incorporated(nn_model_1, cplayer, 6, 4, device=device)
+    robot_miqp = MIQP(nn_model=nn_model_1, device=device)
+    Model_SSL = MIQP_Trainer(robot_miqp)
     model_path, stats_path = resolve_paths(args.model, args.stats_out)
     Model_SSL.nn_model.load_state_dict(torch.load(model_path))
     Model_SSL.evaluate(test_loader, save_path=stats_path)
