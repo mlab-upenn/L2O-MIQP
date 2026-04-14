@@ -12,12 +12,13 @@ The experimental results are shown below.
 
 1. **Robot Navigation Metric** </br></br>
    ![](misc/metric_robot_nav.png) </br></br>
-2. **Robot Navigation Fail Rate** </br>
+2. **Robot Navigation Trajectory Infeasibility** </br>
    This plot shows the MPC lookahead trajectory collision rate. Our method shows a significant improvement in solving a "physically" safe solution. </br></br>
-   <img src="misc/fail_rate_robot_nav.png" width="400" alt="Robot Navigation Fail Rate"> </br></br>
+   <img src="misc/f_robot_nav.png" width="400" alt="Robot Navigation Fail Rate"> </br></br>
 3. **Energy Tank Metric** </br></br>
    ![](misc/metric_energy_tank.png)
-
+4. **Energy Tank Trajectory Infeasibility** </br></br>
+   <img src="misc/f_energy_tank.png" width="400" alt="Energy Tank Fail Rate"> </br></br>
 
 
 
