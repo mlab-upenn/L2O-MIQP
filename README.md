@@ -2,9 +2,32 @@
 
 This repository contains the code for the project *Learning to Optimize (L2O)* applied to mixed-integer quadratic programming (MIQP).
 
+Read the paper: [arXiv](https://arxiv.org/abs/2511.19383)
+
 ## Overview
 
 We implemented a L2O framework that leverages a quadratic programming (QP) layer to embed the dependence between integer and continuous decision variables, and utilizes a hybrid loss function combining supervised and self-supervised losses to leverage the strengths of both during training.
+
+The experimental results are shown below.
+
+1. **Robot Navigation Metric** </br></br>
+   ![](misc/metric_robot_nav.png) </br></br>
+2. **Robot Navigation Fail Rate** </br>
+   This plot shows the MPC lookahead trajectory collision rate. Our method shows a significant improvement in solving a "physically" safe solution. </br></br>
+   <img src="misc/fail_rate_robot_nav.png" width="400" alt="Robot Navigation Fail Rate"> </br></br>
+3. **Energy Tank Metric** </br></br>
+   ![](misc/metric_energy_tank.png)
+
+
+
+
+Where
+- **SL**: **S**upervised **L**earning with QP layer
+- **SSL**: **S**elf-**S**upervised **L**earning with QP layer
+- **C-SSL**: Self-Supervised Learning applied to predict both discrete and continuous variables end-to-end.
+- **H-L2O**: **H**ybrid **L**earning-to-**O**ptimize (proposed method)
+
+
 
 ## Installation
 
