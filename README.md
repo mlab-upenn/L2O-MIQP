@@ -25,7 +25,7 @@ The experimental results are shown below.
 Where
 - **SL**: **S**upervised **L**earning with QP layer
 - **SSL**: **S**elf-**S**upervised **L**earning with QP layer
-- **C-SSL**: Self-Supervised Learning applied to predict both discrete and continuous variables end-to-end.
+- **C-SSL**: **C**onventional **S**elf-**S**upervised **L**earning applied to predict both discrete and continuous variables end-to-end.
 - **H-L2O**: **H**ybrid **L**earning-to-**O**ptimize (proposed method)
 
 
